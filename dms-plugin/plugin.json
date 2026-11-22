@@ -1,0 +1,23 @@
+{
+    "id": "renderRoute",
+    "name": "RenderRoute",
+    "description": "Choose which GPU specific Linux processes and apps use, monitor active GPU workloads, and manage per-app GPU rules",
+    "version": "1.0.0",
+    "author": "diamondjirapat",
+    "license": "GPL-3.0",
+    "repo": "https://github.com/diamondjirapat/RenderRoute",
+    "type": "widget",
+    "capabilities": [
+        "dankbar-widget",
+        "control-center-widget"
+    ],
+    "component": "./RenderRouteWidget.qml",
+    "settings": "./RenderRouteSettings.qml",
+    "icon": "memory",
+    "requires_dms": ">=1.2.0",
+    "permissions": [
+        "settings_read",
+        "settings_write",
+        "process"
+    ]
+}
