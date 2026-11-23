@@ -2,6 +2,7 @@ package gpu
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -52,11 +53,13 @@ func BuildRoutingEnv(target GPU, allGPUs []GPU) RoutingEnv {
 			set["__EGL_VENDOR_LIBRARY_FILENAMES"] = strings.Join(target.EGLVendors, ":")
 		}
 
-		// Clear Mesa-specific routing variables that might be inherited
+		// Clear Mesa-specific and AMD ROCm routing variables that might be inherited
 		unset = []string{
 			"DRI_PRIME",
-			"MESA_VK_DEVICE_SELECT",
+			"HIP_VISIBLE_DEVICES",
 			"LIBVA_DRIVER_NAME",
+			"MESA_VK_DEVICE_SELECT",
+			"ROCR_VISIBLE_DEVICES",
 			"VDPAU_DRIVER",
 		}
 	} else {
@@ -88,9 +91,18 @@ func BuildRoutingEnv(target GPU, allGPUs []GPU) RoutingEnv {
 			set["__EGL_VENDOR_LIBRARY_FILENAMES"] = strings.Join(target.EGLVendors, ":")
 		}
 
+		// Explicitly strip NVIDIA offload variables if inherited
+		unset = []string{
+			"__NV_PRIME_RENDER_OFFLOAD",
+			"__NV_PRIME_RENDER_OFFLOAD_PROVIDER",
+			"__VK_LAYER_NV_optimus",
+			"CUDA_VISIBLE_DEVICES",
+		}
+
 		switch target.Vendor {
 		case "intel":
 			set["LIBVA_DRIVER_NAME"] = "iHD"
+			unset = append(unset, "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "VDPAU_DRIVER")
 		case "amd":
 			set["LIBVA_DRIVER_NAME"] = "radeonsi"
 			set["VDPAU_DRIVER"] = "radeonsi"
@@ -106,14 +118,8 @@ func BuildRoutingEnv(target GPU, allGPUs []GPU) RoutingEnv {
 			}
 			set["ROCR_VISIBLE_DEVICES"] = fmt.Sprintf("%d", amdIdx)
 			set["HIP_VISIBLE_DEVICES"] = fmt.Sprintf("%d", amdIdx)
-		}
-
-		// Explicitly strip NVIDIA offload variables if inherited
-		unset = []string{
-			"__NV_PRIME_RENDER_OFFLOAD",
-			"__NV_PRIME_RENDER_OFFLOAD_PROVIDER",
-			"__VK_LAYER_NV_optimus",
-			"CUDA_VISIBLE_DEVICES",
+		default:
+			unset = append(unset, "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
 		}
 	}
 
@@ -122,6 +128,64 @@ func BuildRoutingEnv(target GPU, allGPUs []GPU) RoutingEnv {
 		GPU:   target,
 		Set:   set,
 		Unset: unset,
+	}
+}
+
+// IsFlatpakCommand reports whether argv launches an application via `flatpak run ...`
+// (accounting for optional `env KEY=VAL ...` wrappers).
+func IsFlatpakCommand(argv []string) bool {
+	for i := 0; i < len(argv); i++ {
+		tok := argv[i]
+		if i == 0 && filepath.Base(tok) == "env" {
+			continue
+		}
+		if strings.Contains(tok, "=") && !strings.HasPrefix(tok, "/") {
+			continue
+		}
+		if filepath.Base(tok) == "flatpak" {
+			for j := i + 1; j < len(argv); j++ {
+				if argv[j] == "run" {
+					return true
+				}
+				if !strings.HasPrefix(argv[j], "-") {
+					return false
+				}
+			}
+		}
+		return false
+	}
+	return false
+}
+
+// ForFlatpak returns a copy of RoutingEnv safe for Flatpak sandboxes by removing
+// host-filesystem Vulkan/EGL manifest paths that do not exist inside the sandbox.
+func (r RoutingEnv) ForFlatpak() RoutingEnv {
+	hostOnly := []string{
+		"VK_DRIVER_FILES",
+		"VK_ICD_FILENAMES",
+		"__EGL_VENDOR_LIBRARY_FILENAMES",
+	}
+	newSet := make(map[string]string, len(r.Set))
+	for k, v := range r.Set {
+		newSet[k] = v
+	}
+	unsetMap := make(map[string]bool, len(r.Unset)+len(hostOnly))
+	for _, k := range r.Unset {
+		unsetMap[k] = true
+	}
+	for _, k := range hostOnly {
+		delete(newSet, k)
+		unsetMap[k] = true
+	}
+	newUnset := make([]string, 0, len(unsetMap))
+	for k := range unsetMap {
+		newUnset = append(newUnset, k)
+	}
+	sort.Strings(newUnset)
+	return RoutingEnv{
+		GPU:   r.GPU,
+		Set:   newSet,
+		Unset: newUnset,
 	}
 }
 

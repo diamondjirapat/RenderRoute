@@ -52,6 +52,20 @@ type GPU struct {
 	ActiveProcCount  int      `json:"active_proc_count"`
 }
 
+// GPUWarning describes a PCI graphics adapter that is visible on the bus but has no
+// active DRM device in /sys/class/drm (for example, when a kernel driver probe or
+// firmware load failed).
+type GPUWarning struct {
+	PCISlot  string `json:"pci_slot"`
+	VendorID string `json:"vendor_id,omitempty"`
+	DeviceID string `json:"device_id,omitempty"`
+	Vendor   string `json:"vendor,omitempty"`
+	Driver   string `json:"driver,omitempty"`
+	Name     string `json:"name"`
+	Role     Role   `json:"role"`
+	Reason   string `json:"reason"`
+}
+
 var cardDirRe = regexp.MustCompile(`^card([0-9]+)$`)
 
 // NormalizePCISlot converts variants like "00000000:01:00.0" or "01:00.0" to lowercase "0000:01:00.0".
@@ -716,4 +730,142 @@ func Resolve(gpus []GPU, selector string) (*GPU, error) {
 	}
 
 	return nil, fmt.Errorf("no GPU matching %q", selector)
+}
+
+// DetectUnboundPCIGPUs scans /sys/bus/pci/devices for display-class PCI adapters that
+// do not have a corresponding DRM device in discovered (never wakes suspended GPUs).
+func DetectUnboundPCIGPUs(discovered []GPU) []GPUWarning {
+	return DetectUnboundPCIGPUsFrom("/sys/bus/pci/devices", discovered, nil)
+}
+
+// DetectUnboundPCIGPUsFrom scans a custom PCI sysfs root for display-class devices missing
+// from discovered. If lspciNames is nil, lspci is queried once only when an unbound GPU is found.
+func DetectUnboundPCIGPUsFrom(sysPCIRoot string, discovered []GPU, lspciNames map[string]string) []GPUWarning {
+	entries, err := os.ReadDir(sysPCIRoot)
+	if err != nil {
+		return nil
+	}
+
+	knownSlots := make(map[string]bool, len(discovered))
+	for _, g := range discovered {
+		if g.PCISlot != "" {
+			knownSlots[NormalizePCISlot(g.PCISlot)] = true
+		}
+	}
+
+	var warnings []GPUWarning
+	for _, e := range entries {
+		slot := NormalizePCISlot(e.Name())
+		if slot == "" || knownSlots[slot] {
+			continue
+		}
+		devSys := filepath.Join(sysPCIRoot, e.Name())
+		pciClass := strings.ToLower(readTrimmed(filepath.Join(devSys, "class")))
+		// PCI base class 0x03 = Display controller (VGA 0x0300xx, 3D 0x0302xx, Display 0x0380xx)
+		if !strings.HasPrefix(pciClass, "0x03") {
+			continue
+		}
+
+		if lspciNames == nil {
+			lspciNames = queryLspciNames()
+		}
+
+		uevent := parseUevent(filepath.Join(devSys, "uevent"))
+		vendorID := strings.ToLower(readTrimmed(filepath.Join(devSys, "vendor")))
+		deviceID := strings.ToLower(readTrimmed(filepath.Join(devSys, "device")))
+		driver := strings.ToLower(uevent["DRIVER"])
+		bootVGA := readTrimmed(filepath.Join(devSys, "boot_vga")) == "1"
+
+		vendor := VendorFromID(vendorID)
+		if vendor == "unknown" {
+			switch driver {
+			case "nvidia", "nouveau":
+				vendor = "nvidia"
+			case "i915", "xe":
+				vendor = "intel"
+			case "amdgpu", "radeon":
+				vendor = "amd"
+			}
+		}
+
+		name := lspciNames[slot]
+		if name == "" {
+			name = fallbackGPUName(vendor, driver, vendorID, deviceID)
+		}
+
+		candidate := GPU{
+			PCISlot:  slot,
+			VendorID: vendorID,
+			DeviceID: deviceID,
+			Vendor:   vendor,
+			Driver:   driver,
+			Name:     name,
+			BootVGA:  bootVGA,
+		}
+		tmp := append([]GPU(nil), discovered...)
+		tmp = append(tmp, candidate)
+		classifyRoles(tmp)
+		role := tmp[len(tmp)-1].Role
+
+		var reason string
+		switch {
+		case driver == "":
+			reason = "PCI display device has no kernel driver bound and no DRM node in /sys/class/drm"
+		case driver == "nvidia":
+			reason = `kernel driver "nvidia" is bound on PCI but created no DRM node in /sys/class/drm (driver/firmware version mismatch, failed probe, or nvidia_drm.modeset=0; check dmesg/journalctl)`
+		default:
+			reason = fmt.Sprintf("kernel driver %q is bound on PCI but created no DRM node in /sys/class/drm (check dmesg/journalctl)", driver)
+		}
+
+		warnings = append(warnings, GPUWarning{
+			PCISlot:  slot,
+			VendorID: vendorID,
+			DeviceID: deviceID,
+			Vendor:   vendor,
+			Driver:   driver,
+			Name:     name,
+			Role:     role,
+			Reason:   reason,
+		})
+	}
+
+	sort.Slice(warnings, func(i, j int) bool {
+		return warnings[i].PCISlot < warnings[j].PCISlot
+	})
+	return warnings
+}
+
+// FormatResolveError enriches a Resolve failure with diagnostic details if an uninitialized
+// PCI GPU exists that matches the requested selector.
+func FormatResolveError(selector string, err error, warnings []GPUWarning) error {
+	if err == nil || len(warnings) == 0 {
+		return err
+	}
+	low := strings.ToLower(strings.TrimSpace(selector))
+	normPCI := NormalizePCISlot(low)
+
+	var matched []GPUWarning
+	for _, w := range warnings {
+		switch {
+		case (low == "dgpu" || low == "discrete" || low == "dedicated" || low == "external") && w.Role == RoleDiscrete:
+			matched = append(matched, w)
+		case (low == "igpu" || low == "integrated" || low == "internal") && w.Role == RoleIntegrated:
+			matched = append(matched, w)
+		case normPCI != "" && w.PCISlot == normPCI:
+			matched = append(matched, w)
+		case strings.EqualFold(w.Vendor, low) || strings.EqualFold(w.Driver, low):
+			matched = append(matched, w)
+		case low != "" && strings.Contains(strings.ToLower(w.Name), low):
+			matched = append(matched, w)
+		}
+	}
+	if len(matched) == 0 {
+		matched = warnings
+	}
+
+	parts := make([]string, 0, len(matched))
+	for _, w := range matched {
+		parts = append(parts, fmt.Sprintf("%s [%s]: %s", w.Name, w.PCISlot, w.Reason))
+	}
+	return fmt.Errorf("%w (uninitialized PCI GPU detected: %s)", err, strings.Join(parts, "; "))
 }

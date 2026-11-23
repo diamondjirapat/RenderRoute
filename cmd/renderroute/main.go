@@ -31,6 +31,7 @@ type StatusPayload struct {
 	DGPUProcessCount int               `json:"dgpu_process_count"`
 	TotalProcesses   int               `json:"total_processes"`
 	GPUs             []gpu.GPU         `json:"gpus"`
+	Warnings         []gpu.GPUWarning  `json:"warnings,omitempty"`
 	Processes        []proc.GPUProcess `json:"processes"`
 	Rules            []config.Rule     `json:"rules"`
 }
@@ -153,28 +154,37 @@ func cmdGPUs(args []string) error {
 	}
 	if len(gpus) == 0 {
 		fmt.Println("No GPUs detected.")
-		return nil
+	} else {
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "IDX\tROLE\tCARD\tRENDER\tPCI\tDRIVER\tPOWER\tTEMP\tVRAM\tNAME")
+		for _, g := range gpus {
+			temp := "-"
+			if g.TemperatureC != nil {
+				temp = fmt.Sprintf("%.0f°C", *g.TemperatureC)
+			}
+			vram := "-"
+			if g.VRAMUsedMB != nil && g.VRAMTotalMB != nil {
+				vram = fmt.Sprintf("%.0f/%.0fMB", *g.VRAMUsedMB, *g.VRAMTotalMB)
+			}
+			render := g.RenderNode
+			if render == "" {
+				render = "-"
+			}
+			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				g.Index, g.Role, g.Card, render, g.PCISlot, g.Driver, g.PowerState, temp, vram, g.Name)
+		}
+		if err := w.Flush(); err != nil {
+			return err
+		}
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "IDX\tROLE\tCARD\tRENDER\tPCI\tDRIVER\tPOWER\tTEMP\tVRAM\tNAME")
-	for _, g := range gpus {
-		temp := "-"
-		if g.TemperatureC != nil {
-			temp = fmt.Sprintf("%.0f°C", *g.TemperatureC)
+	if warnings := gpu.DetectUnboundPCIGPUs(gpus); len(warnings) > 0 {
+		fmt.Fprintln(os.Stderr)
+		for _, warn := range warnings {
+			fmt.Fprintf(os.Stderr, "WARNING: %s (%s, %s): %s\n", warn.Name, warn.Role, warn.PCISlot, warn.Reason)
 		}
-		vram := "-"
-		if g.VRAMUsedMB != nil && g.VRAMTotalMB != nil {
-			vram = fmt.Sprintf("%.0f/%.0fMB", *g.VRAMUsedMB, *g.VRAMTotalMB)
-		}
-		render := g.RenderNode
-		if render == "" {
-			render = "-"
-		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			g.Index, g.Role, g.Card, render, g.PCISlot, g.Driver, g.PowerState, temp, vram, g.Name)
 	}
-	return w.Flush()
+	return nil
 }
 
 func cmdPS(args []string) error {
@@ -258,10 +268,12 @@ func cmdStatus(args []string) error {
 		}
 	}
 
+	warnings := gpu.DetectUnboundPCIGPUs(gpus)
+
 	defSel := cfg.DefaultGPU
 	defID := ""
 	defShort := defSel
-	if resolved, err := resolveWithConfig(gpus, cfg, defSel); err == nil {
+	if resolved, err := resolveWithConfig(gpus, cfg, "default"); err == nil {
 		defID = resolved.ID
 		defShort = resolved.ShortName
 	}
@@ -275,6 +287,7 @@ func cmdStatus(args []string) error {
 		DGPUProcessCount: dgpuProcs,
 		TotalProcesses:   len(procs),
 		GPUs:             gpus,
+		Warnings:         warnings,
 		Processes:        procs,
 		Rules:            cfg.SortedRules(),
 	}
@@ -292,6 +305,9 @@ func cmdStatus(args []string) error {
 	fmt.Printf("Default GPU: %s (%s)\n", payload.DefaultGPUShort, payload.DefaultGPU)
 	fmt.Printf("GPUs: %d | Active GPU processes: %d (dGPU: %d, dGPU awake: %v) | Saved rules: %d\n",
 		len(payload.GPUs), payload.TotalProcesses, payload.DGPUProcessCount, payload.DGPUActive, len(payload.Rules))
+	for _, warn := range payload.Warnings {
+		fmt.Fprintf(os.Stderr, "WARNING: %s (%s, %s): %s\n", warn.Name, warn.Role, warn.PCISlot, warn.Reason)
+	}
 	return nil
 }
 
@@ -395,7 +411,7 @@ func cmdRun(args []string) error {
 			selector = r.GPU
 			extraEnv = r.ExtraEnv
 		} else {
-			selector = cfg.DefaultGPU
+			selector = "default"
 		}
 	} else {
 		if r, ok := cfg.MatchRule(cmdArgs[0], filepath.Base(cmdArgs[0])); ok {
@@ -414,6 +430,9 @@ func cmdRun(args []string) error {
 	}
 
 	routing := gpu.BuildRoutingEnv(*target, gpus)
+	if gpu.IsFlatpakCommand(cmdArgs) {
+		routing = routing.ForFlatpak()
+	}
 	finalEnv := routing.Apply(os.Environ(), extraEnv)
 
 	if detach {
@@ -465,7 +484,7 @@ func cmdDefault(args []string) error {
 	if newSel != "" {
 		resolved, err := gpu.Resolve(gpus, newSel)
 		if err != nil {
-			return err
+			return gpu.FormatResolveError(newSel, err, gpu.DetectUnboundPCIGPUs(gpus))
 		}
 		// Persist canonical role ("igpu"/"dgpu") if user passed role, else stable PCI ID
 		low := strings.ToLower(newSel)
@@ -479,7 +498,7 @@ func cmdDefault(args []string) error {
 		}
 	}
 
-	resolved, _ := resolveWithConfig(gpus, cfg, cfg.DefaultGPU)
+	resolved, _ := resolveWithConfig(gpus, cfg, "default")
 	if asJSON {
 		out := map[string]any{
 			"default_gpu": cfg.DefaultGPU,
@@ -567,7 +586,7 @@ func cmdRule(args []string) error {
 		}
 		resolved, err := gpu.Resolve(gpus, gpuSel)
 		if err != nil {
-			return err
+			return gpu.FormatResolveError(gpuSel, err, gpu.DetectUnboundPCIGPUs(gpus))
 		}
 
 		storedSel := strings.ToLower(gpuSel)
@@ -754,7 +773,7 @@ func cmdLaunch(args []string) error {
 		extraEnv = r.ExtraEnv
 	}
 	if gpuSel == "" {
-		gpuSel = cfg.DefaultGPU
+		gpuSel = "default"
 	}
 
 	target, err := resolveWithConfig(gpus, cfg, gpuSel)
@@ -797,7 +816,7 @@ func cmdDesktop(args []string) error {
 		}
 		resolved, err := gpu.Resolve(gpus, gpuSel)
 		if err != nil {
-			return err
+			return gpu.FormatResolveError(gpuSel, err, gpu.DetectUnboundPCIGPUs(gpus))
 		}
 		storedSel := strings.ToLower(gpuSel)
 		if storedSel != "igpu" && storedSel != "dgpu" {
@@ -948,17 +967,28 @@ func cmdDMS(args []string) error {
 }
 
 func resolveWithConfig(gpus []gpu.GPU, cfg *config.Config, selector string) (*gpu.GPU, error) {
-	if selector == "" || strings.EqualFold(selector, "default") {
+	return resolveWithConfigAndWarnings(gpus, cfg, selector, nil)
+}
+
+func resolveWithConfigAndWarnings(gpus []gpu.GPU, cfg *config.Config, selector string, warnings []gpu.GPUWarning) (*gpu.GPU, error) {
+	usedDefault := selector == "" || strings.EqualFold(selector, "default")
+	if usedDefault {
 		if cfg != nil && cfg.DefaultGPU != "" {
 			selector = cfg.DefaultGPU
 		}
 	}
 	g, err := gpu.Resolve(gpus, selector)
-	if err != nil && (selector == "igpu" || selector == "dgpu") && len(gpus) > 0 {
-		// Graceful fallback on single-GPU machines when default is "igpu"/"dgpu"
-		return &gpus[0], nil
+	if err != nil {
+		if usedDefault && (strings.EqualFold(selector, "igpu") || strings.EqualFold(selector, "dgpu")) && len(gpus) > 0 {
+			// Graceful fallback on single-GPU machines only when resolving the implicit default GPU.
+			return &gpus[0], nil
+		}
+		if warnings == nil {
+			warnings = gpu.DetectUnboundPCIGPUs(gpus)
+		}
+		return nil, gpu.FormatResolveError(selector, err, warnings)
 	}
-	return g, err
+	return g, nil
 }
 
 func selfBinaryForDesktop() string {

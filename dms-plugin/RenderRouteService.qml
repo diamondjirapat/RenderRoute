@@ -38,6 +38,7 @@ Item {
     property int dgpuProcessCount: 0
     property int totalProcesses: 0
     property var gpus: []
+    property var warnings: []
     property var processes: []
     property var rules: []
     property var apps: []
@@ -116,6 +117,7 @@ Item {
         PluginService.setGlobalVar(pluginId, "defaultGpu", defaultGpu);
         PluginService.setGlobalVar(pluginId, "defaultGpuShort", defaultGpuShort);
         PluginService.setGlobalVar(pluginId, "gpus", gpus);
+        PluginService.setGlobalVar(pluginId, "warnings", warnings);
     }
 
     function refresh() {
@@ -141,6 +143,7 @@ Item {
                 root.dgpuProcessCount = Number(data.dgpu_process_count || 0);
                 root.totalProcesses = Number(data.total_processes || 0);
                 root.gpus = Array.isArray(data.gpus) ? data.gpus : [];
+                root.warnings = Array.isArray(data.warnings) ? data.warnings : [];
                 root.processes = Array.isArray(data.processes) ? data.processes : [];
                 root.rules = Array.isArray(data.rules) ? data.rules : [];
                 root.syncGlobals();

@@ -453,6 +453,54 @@ PluginComponent {
                     }
                 }
 
+                // Uninitialized PCI GPU warning banner
+                StyledRect {
+                    id: gpuWarningBanner
+                    visible: RenderRouteService.available && RenderRouteService.warnings.length > 0
+                    width: parent.width
+                    height: warningCol.implicitHeight + Theme.spacingS * 2
+                    radius: Theme.cornerRadius
+                    color: Theme.withAlpha(Theme.warning, 0.14)
+                    border.width: 1
+                    border.color: Theme.withAlpha(Theme.warning, 0.45)
+
+                    Column {
+                        id: warningCol
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: Theme.spacingS
+                        spacing: 3
+
+                        Repeater {
+                            model: RenderRouteService.warnings
+
+                            Column {
+                                required property var modelData
+                                width: warningCol.width
+                                spacing: 1
+
+                                StyledText {
+                                    width: parent.width
+                                    text: `GPU driver issue: ${modelData.name || modelData.pci_slot} (${(modelData.role || "").toUpperCase()})`
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    font.weight: Font.Bold
+                                    color: Theme.warning
+                                    elide: Text.ElideRight
+                                }
+
+                                StyledText {
+                                    width: parent.width
+                                    wrapMode: Text.WordWrap
+                                    text: modelData.reason || "No DRM device in /sys/class/drm"
+                                    font.pixelSize: Theme.fontSizeSmall - 2
+                                    color: Theme.surfaceText
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 2. GPU Cards Strip (click a card to set Default GPU)
                 Row {
                     id: gpuCardsRow
@@ -598,7 +646,7 @@ PluginComponent {
                 // 4. Tab Content Area
                 Item {
                     width: parent.width
-                    height: Math.max(180, popoutScope.height - Theme.spacingM * 2 - 36 - (gpuCardsRow.visible ? gpuCardsRow.height + Theme.spacingS : 0) - 30 - Theme.spacingS * 3)
+                    height: Math.max(180, popoutScope.height - Theme.spacingM * 2 - 36 - (gpuWarningBanner.visible ? gpuWarningBanner.height + Theme.spacingS : 0) - (gpuCardsRow.visible ? gpuCardsRow.height + Theme.spacingS : 0) - 30 - Theme.spacingS * 3)
 
                     // ================= TAB 0: ACTIVE GPU PROCESSES =================
                     Column {

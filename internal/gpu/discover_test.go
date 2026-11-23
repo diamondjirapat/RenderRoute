@@ -1,8 +1,10 @@
 package gpu
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -95,5 +97,67 @@ func TestDiscoverFromSyntheticSysfsAndResolve(t *testing.T) {
 		if got.ID != wantID {
 			t.Errorf("Resolve(%q) = %q, want %q", sel, got.ID, wantID)
 		}
+	}
+}
+
+func TestDetectUnboundPCIGPUsAndFormatResolveError(t *testing.T) {
+	pciRoot := t.TempDir()
+
+	// Bound Intel iGPU (already discovered)
+	igpuDir := filepath.Join(pciRoot, "0000:00:02.0")
+	_ = os.MkdirAll(igpuDir, 0o755)
+	_ = os.WriteFile(filepath.Join(igpuDir, "class"), []byte("0x030000\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(igpuDir, "vendor"), []byte("0x8086\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(igpuDir, "device"), []byte("0xa78b\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(igpuDir, "boot_vga"), []byte("1\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(igpuDir, "uevent"), []byte("DRIVER=i915\nPCI_SLOT_NAME=0000:00:02.0\n"), 0o644)
+
+	// Unbound NVIDIA dGPU (present on PCI, missing from /sys/class/drm)
+	dgpuDir := filepath.Join(pciRoot, "0000:01:00.0")
+	_ = os.MkdirAll(dgpuDir, 0o755)
+	_ = os.WriteFile(filepath.Join(dgpuDir, "class"), []byte("0x030000\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dgpuDir, "vendor"), []byte("0x10de\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dgpuDir, "device"), []byte("0x28e1\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dgpuDir, "boot_vga"), []byte("0\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dgpuDir, "uevent"), []byte("DRIVER=nvidia\nPCI_SLOT_NAME=0000:01:00.0\n"), 0o644)
+
+	// Non-display PCI device (audio controller) must be ignored
+	audioDir := filepath.Join(pciRoot, "0000:01:00.1")
+	_ = os.MkdirAll(audioDir, 0o755)
+	_ = os.WriteFile(filepath.Join(audioDir, "class"), []byte("0x040300\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(audioDir, "vendor"), []byte("0x10de\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(audioDir, "device"), []byte("0x22be\n"), 0o644)
+
+	discovered := []GPU{
+		{
+			Index:   0,
+			ID:      "0000:00:02.0",
+			PCISlot: "0000:00:02.0",
+			Vendor:  "intel",
+			Driver:  "i915",
+			Role:    RoleIntegrated,
+			BootVGA: true,
+		},
+	}
+
+	lspciNames := map[string]string{
+		"0000:01:00.0": "NVIDIA GeForce RTX 4050 Max-Q / Mobile",
+	}
+
+	warnings := DetectUnboundPCIGPUsFrom(pciRoot, discovered, lspciNames)
+	if len(warnings) != 1 {
+		t.Fatalf("expected 1 unbound PCI GPU warning, got %d: %+v", len(warnings), warnings)
+	}
+	w := warnings[0]
+	if w.PCISlot != "0000:01:00.0" || w.Role != RoleDiscrete || w.Vendor != "nvidia" || w.Driver != "nvidia" {
+		t.Errorf("unexpected warning: %+v", w)
+	}
+	if !strings.Contains(w.Reason, "no DRM node") {
+		t.Errorf("expected DRM diagnostic in reason, got %q", w.Reason)
+	}
+
+	formatted := FormatResolveError("dgpu", errors.New("no discrete GPU found"), warnings)
+	if !strings.Contains(formatted.Error(), "0000:01:00.0") || !strings.Contains(formatted.Error(), "RTX 4050") {
+		t.Errorf("expected enriched resolve error with unbound dGPU details, got: %v", formatted)
 	}
 }

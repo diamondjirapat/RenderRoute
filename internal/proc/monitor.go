@@ -516,6 +516,9 @@ func RelaunchProcess(pid int, target gpu.GPU, allGPUs []gpu.GPU, extraEnv map[st
 	}
 
 	routing := gpu.BuildRoutingEnv(target, allGPUs)
+	if gpu.IsFlatpakCommand(argv) {
+		routing = routing.ForFlatpak()
+	}
 	cmd := exec.Command(bin, argv[1:]...)
 	if cwd != "" {
 		cmd.Dir = cwd

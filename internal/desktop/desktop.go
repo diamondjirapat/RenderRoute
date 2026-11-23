@@ -314,16 +314,26 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 	lines := strings.Split(content, "\n")
 	var out []string
 	inEntry := false
+	inAction := false
 	entrySeen := false
 	wroteMeta := false
 	wrotePrefers := false
 	var origExec string
+	origDBusActivatable := false
 
-	// First pass: see if X-RenderRoute-Original-Exec already exists
+	// First pass: preserve original metadata if re-patching an already managed file
 	for _, l := range lines {
-		if k, v, ok := strings.Cut(strings.TrimSpace(l), "="); ok && strings.TrimSpace(k) == "X-RenderRoute-Original-Exec" {
-			origExec = strings.TrimSpace(v)
-			break
+		if k, v, ok := strings.Cut(strings.TrimSpace(l), "="); ok {
+			key := strings.TrimSpace(k)
+			val := strings.TrimSpace(v)
+			switch key {
+			case "X-RenderRoute-Original-Exec":
+				origExec = val
+			case "X-RenderRoute-Original-DBusActivatable":
+				if strings.EqualFold(val, "true") {
+					origDBusActivatable = true
+				}
+			}
 		}
 	}
 
@@ -344,6 +354,9 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 		if origExec != "" {
 			out = append(out, "X-RenderRoute-Original-Exec="+origExec)
 		}
+		if origDBusActivatable {
+			out = append(out, "X-RenderRoute-Original-DBusActivatable=true")
+		}
 		wroteMeta = true
 	}
 
@@ -359,6 +372,7 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 				flushMeta()
 			}
 			inEntry = trimmed == "[Desktop Entry]"
+			inAction = strings.HasPrefix(trimmed, "[Desktop Action ")
 			if inEntry {
 				entrySeen = true
 			}
@@ -370,11 +384,18 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 				key := strings.TrimSpace(k)
 				val := strings.TrimSpace(v)
 				switch key {
-				case "X-RenderRoute-GPU", "X-RenderRoute-Original-Exec":
+				case "X-RenderRoute-GPU", "X-RenderRoute-Original-Exec", "X-RenderRoute-Original-DBusActivatable":
 					continue
 				case "PrefersNonDefaultGPU":
 					out = append(out, "PrefersNonDefaultGPU="+prefersVal)
 					wrotePrefers = true
+					continue
+				case "DBusActivatable":
+					// D-Bus activation bypasses Exec= completely; disable it so launchers invoke RenderRoute.
+					if strings.EqualFold(val, "true") {
+						origDBusActivatable = true
+					}
+					out = append(out, "DBusActivatable=false")
 					continue
 				case "Exec":
 					if origExec == "" {
@@ -383,6 +404,11 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 					out = append(out, "Exec="+WrapExec(renderrouteBin, gpuSelector, origExec))
 					continue
 				}
+			}
+		} else if inAction {
+			if k, v, ok := strings.Cut(trimmed, "="); ok && strings.TrimSpace(k) == "Exec" {
+				out = append(out, "Exec="+WrapExec(renderrouteBin, gpuSelector, strings.TrimSpace(v)))
+				continue
 			}
 		}
 		out = append(out, line)
@@ -455,14 +481,24 @@ func ResetDesktopOverrideIn(searchDirs []string, userDir, appID string) (bool, e
 func unpatchDesktopContent(content string) string {
 	lines := strings.Split(content, "\n")
 	var origExec string
+	origDBusActivatable := false
 	for _, l := range lines {
-		if k, v, ok := strings.Cut(strings.TrimSpace(l), "="); ok && strings.TrimSpace(k) == "X-RenderRoute-Original-Exec" {
-			origExec = strings.TrimSpace(v)
-			break
+		if k, v, ok := strings.Cut(strings.TrimSpace(l), "="); ok {
+			key := strings.TrimSpace(k)
+			val := strings.TrimSpace(v)
+			switch key {
+			case "X-RenderRoute-Original-Exec":
+				origExec = val
+			case "X-RenderRoute-Original-DBusActivatable":
+				if strings.EqualFold(val, "true") {
+					origDBusActivatable = true
+				}
+			}
 		}
 	}
 	var out []string
 	inEntry := false
+	inAction := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, managedHeaderPrefix) {
@@ -470,6 +506,7 @@ func unpatchDesktopContent(content string) string {
 		}
 		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
 			inEntry = trimmed == "[Desktop Entry]"
+			inAction = strings.HasPrefix(trimmed, "[Desktop Action ")
 			out = append(out, line)
 			continue
 		}
@@ -478,8 +515,13 @@ func unpatchDesktopContent(content string) string {
 				key := strings.TrimSpace(k)
 				val := strings.TrimSpace(v)
 				switch key {
-				case "X-RenderRoute-GPU", "X-RenderRoute-Original-Exec":
+				case "X-RenderRoute-GPU", "X-RenderRoute-Original-Exec", "X-RenderRoute-Original-DBusActivatable":
 					continue
+				case "DBusActivatable":
+					if origDBusActivatable {
+						out = append(out, "DBusActivatable=true")
+						continue
+					}
 				case "Exec":
 					if origExec != "" {
 						out = append(out, "Exec="+origExec)
@@ -488,6 +530,11 @@ func unpatchDesktopContent(content string) string {
 					}
 					continue
 				}
+			}
+		} else if inAction {
+			if k, v, ok := strings.Cut(trimmed, "="); ok && strings.TrimSpace(k) == "Exec" {
+				out = append(out, "Exec="+UnwrapExec(strings.TrimSpace(v)))
+				continue
 			}
 		}
 		out = append(out, line)
@@ -503,6 +550,9 @@ func LaunchApp(app App, target gpu.GPU, allGPUs []gpu.GPU, extraEnv map[string]s
 	}
 
 	routing := gpu.BuildRoutingEnv(target, allGPUs)
+	if gpu.IsFlatpakCommand(argv) {
+		routing = routing.ForFlatpak()
+	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = routing.Apply(os.Environ(), extraEnv)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}

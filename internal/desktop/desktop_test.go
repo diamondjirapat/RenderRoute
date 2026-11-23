@@ -76,3 +76,71 @@ Categories=Graphics;3DGraphics;
 		t.Errorf("expected user override to be removed when system file exists")
 	}
 }
+
+func TestPatchDesktopDisablesDBusActivatableAndWrapsActions(t *testing.T) {
+	root := t.TempDir()
+	userDir := filepath.Join(root, "user")
+	_ = os.MkdirAll(userDir, 0o755)
+
+	sample := `[Desktop Entry]
+Type=Application
+Name=Ghostty
+Exec=/usr/bin/ghostty
+DBusActivatable=true
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=/usr/bin/ghostty --gtk-single-instance=false
+`
+	userFile := filepath.Join(userDir, "com.mitchellh.ghostty.desktop")
+	_ = os.WriteFile(userFile, []byte(sample), 0o644)
+
+	searchDirs := []string{userDir}
+	dst, err := ApplyDesktopOverrideIn(searchDirs, userDir, "com.mitchellh.ghostty", "dgpu", "renderroute", gpu.RoleDiscrete)
+	if err != nil {
+		t.Fatalf("ApplyDesktopOverrideIn failed: %v", err)
+	}
+	raw, _ := os.ReadFile(dst)
+	patched := string(raw)
+
+	if !strings.Contains(patched, "DBusActivatable=false") {
+		t.Errorf("expected DBusActivatable=false in patched file:\n%s", patched)
+	}
+	if !strings.Contains(patched, "X-RenderRoute-Original-DBusActivatable=true") {
+		t.Errorf("expected X-RenderRoute-Original-DBusActivatable=true in patched file:\n%s", patched)
+	}
+	if !strings.Contains(patched, "Exec=renderroute run dgpu -- /usr/bin/ghostty --gtk-single-instance=false") {
+		t.Errorf("expected [Desktop Action new-window] Exec= to be wrapped:\n%s", patched)
+	}
+
+	// Re-patch to igpu: must remain idempotent and keep original DBusActivatable marker
+	if _, err := ApplyDesktopOverrideIn(searchDirs, userDir, "com.mitchellh.ghostty", "igpu", "renderroute", gpu.RoleIntegrated); err != nil {
+		t.Fatalf("second ApplyDesktopOverrideIn failed: %v", err)
+	}
+	raw2, _ := os.ReadFile(dst)
+	repatched := string(raw2)
+	if strings.Count(repatched, "renderroute run") != 2 {
+		t.Errorf("expected exactly 2 wrapped Exec lines (entry + action), got:\n%s", repatched)
+	}
+	if !strings.Contains(repatched, "X-RenderRoute-Original-DBusActivatable=true") {
+		t.Errorf("lost original DBusActivatable metadata on re-patch:\n%s", repatched)
+	}
+
+	// Reset user-only desktop file: must restore DBusActivatable=true and unwrap action Exec=
+	changed, err := ResetDesktopOverrideIn(searchDirs, userDir, "com.mitchellh.ghostty")
+	if err != nil || !changed {
+		t.Fatalf("ResetDesktopOverrideIn failed: changed=%v err=%v", changed, err)
+	}
+	raw3, _ := os.ReadFile(dst)
+	restored := string(raw3)
+	if !strings.Contains(restored, "DBusActivatable=true") {
+		t.Errorf("expected DBusActivatable=true to be restored:\n%s", restored)
+	}
+	if strings.Contains(restored, "renderroute run") {
+		t.Errorf("expected all Exec= lines to be unwrapped after reset:\n%s", restored)
+	}
+	if !strings.Contains(restored, "Exec=/usr/bin/ghostty --gtk-single-instance=false") {
+		t.Errorf("expected action Exec= to be restored cleanly:\n%s", restored)
+	}
+}
