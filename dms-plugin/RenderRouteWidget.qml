@@ -875,6 +875,20 @@ PluginComponent {
                                                 color: Theme.warning
                                             }
 
+                                            // Proactive warning when expanding the Steam client process before/after pinning
+                                            StyledText {
+                                                visible: procCard.expanded && (
+                                                    (procCard.procData.name || "").toLowerCase() === "steam" ||
+                                                    (procCard.procData.desktop_id || "").toLowerCase() === "steam" ||
+                                                    (procCard.procData.desktop_id || "").toLowerCase() === "com.valvesoftware.steam"
+                                                )
+                                                width: parent.width
+                                                wrapMode: Text.WordWrap
+                                                text: "Warning: Games launched from Steam inherit Steam's GPU. If you pin Steam to iGPU, set per-game Steam Launch Options to: renderroute run dgpu -- %command%"
+                                                font.pixelSize: Theme.fontSizeSmall - 2
+                                                color: Theme.warning
+                                            }
+
                                             // Expanded per-process GPU routing actions
                                             Flow {
                                                 visible: procCard.expanded
@@ -1082,6 +1096,19 @@ PluginComponent {
                                                 }
                                             }
 
+                                            StyledText {
+                                                readonly property bool isSteamClient: !appCard.appData.steam_app_id && (
+                                                    (appCard.appData.id || "").toLowerCase() === "steam" ||
+                                                    (appCard.appData.id || "").toLowerCase() === "com.valvesoftware.steam"
+                                                )
+                                                visible: isSteamClient
+                                                width: parent.width
+                                                wrapMode: Text.WordWrap
+                                                text: "Warning: Games launched from Steam inherit Steam's GPU. If Steam is pinned to iGPU, set per-game Steam Launch Options to: renderroute run dgpu -- %command%"
+                                                font.pixelSize: Theme.fontSizeSmall - 2
+                                                color: Theme.warning
+                                            }
+
                                             Flow {
                                                 width: parent.width
                                                 spacing: Theme.spacingXS
@@ -1281,6 +1308,22 @@ PluginComponent {
                                                     font.pixelSize: Theme.fontSizeSmall - 2
                                                     color: ruleCard.ruleData.desktop_patched ? Theme.primary : Theme.surfaceVariantText
                                                 }
+                                            }
+
+                                            StyledText {
+                                                readonly property bool isSteamClient: (
+                                                    (ruleCard.ruleData.target || "").toLowerCase() === "steam" ||
+                                                    (ruleCard.ruleData.desktop_id || "").toLowerCase() === "steam" ||
+                                                    (ruleCard.ruleData.desktop_id || "").toLowerCase() === "com.valvesoftware.steam"
+                                                )
+                                                visible: isSteamClient
+                                                width: parent.width
+                                                wrapMode: Text.WordWrap
+                                                text: (ruleCard.ruleData.gpu || "").toLowerCase() === "igpu"
+                                                    ? "Warning: Games launched from Steam inherit iGPU. Set per-game Steam Launch Options to: renderroute run dgpu -- %command%"
+                                                    : "Note: Games launched from Steam inherit this GPU unless overridden in Steam Launch Options (renderroute run <gpu> -- %command%)."
+                                                font.pixelSize: Theme.fontSizeSmall - 2
+                                                color: Theme.warning
                                             }
 
                                             Flow {

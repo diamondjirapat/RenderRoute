@@ -705,6 +705,12 @@ func cmdRule(args []string) error {
 		}
 		if steamAppID != "" {
 			fmt.Printf(" [steam game: set Steam Launch Options to \"renderroute run %s -- %%command%%\"]", storedSel)
+		} else if isSteamClientRule(targetName, desktopID, steamAppID) {
+			if resolved.Role == gpu.RoleIntegrated {
+				fmt.Printf(" [steam client: games launched from Steam will inherit igpu; set per-game Steam Launch Options to \"renderroute run dgpu -- %%command%%\" for dGPU games]")
+			} else {
+				fmt.Printf(" [steam client: games launched from Steam will inherit %s unless overridden in Steam Launch Options (\"renderroute run <gpu> -- %%command%%\")]", storedSel)
+			}
 		}
 		fmt.Println()
 		return nil
@@ -1172,6 +1178,19 @@ func collectRoutingWarnings(procs []proc.GPUProcess) []RoutingWarning {
 		})
 	}
 	return out
+}
+
+func isSteamClientRule(targetName, desktopID, steamAppID string) bool {
+	if steamAppID != "" {
+		return false
+	}
+	for _, cand := range []string{targetName, desktopID} {
+		norm := config.NormalizeKey(cand)
+		if norm == "steam" || norm == "com.valvesoftware.steam" {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveRuleApp(apps []desktop.App, targetName, desktopID, displayName string) (resolvedTarget, resolvedDesktopID, resolvedDisplayName, steamAppID string) {

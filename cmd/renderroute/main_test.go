@@ -112,3 +112,18 @@ func TestCollectRoutingWarningsDeduplicatesPerPIDAndCode(t *testing.T) {
 		t.Errorf("unexpected routing warning: %+v", got[0])
 	}
 }
+
+func TestIsSteamClientRule(t *testing.T) {
+	if !isSteamClientRule("steam", "steam", "") {
+		t.Errorf("expected native steam client to match")
+	}
+	if !isSteamClientRule("steam", "com.valvesoftware.Steam", "") {
+		t.Errorf("expected flatpak steam client to match")
+	}
+	if isSteamClientRule("Detroit Become Human", "Detroit Become Human", "1222140") {
+		t.Errorf("expected steam game shortcut not to be treated as steam client")
+	}
+	if isSteamClientRule("dolphin", "org.kde.dolphin", "") {
+		t.Errorf("expected unrelated app not to match")
+	}
+}

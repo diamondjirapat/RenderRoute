@@ -254,6 +254,11 @@ Item {
                         `Pinned ${label} -> ${gpuLabel}`,
                         `If Steam runs on another GPU, set Steam Launch Options to: renderroute run ${gpuSelector} -- %command%`
                     );
+                } else if (out.indexOf("[steam client:") !== -1) {
+                    const details = gpuSelector.toLowerCase() === "igpu"
+                        ? "Games launched from Steam will inherit iGPU. Set per-game Steam Launch Options to: renderroute run dgpu -- %command%"
+                        : `Games launched from Steam will inherit ${gpuLabel} unless overridden in Steam Launch Options (renderroute run <gpu> -- %command%).`;
+                    ToastService.showWarning(`Pinned ${label} -> ${gpuLabel}`, details);
                 } else if (out.indexOf("[no .desktop found") !== -1) {
                     ToastService.showWarning(
                         `Saved rule ${label} -> ${gpuLabel} (no .desktop found)`,
