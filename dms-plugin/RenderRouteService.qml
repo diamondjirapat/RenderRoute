@@ -227,17 +227,24 @@ Item {
         }, 50, 5000);
     }
 
-    function removeRule(target) {
-        if (!target)
+    function removeRule(target, desktopId) {
+        if (!target && !desktopId)
             return;
-        Proc.runCommand(`${pluginId}.rmRule`, [binaryPath, "rule", "remove", target], (stdout, exitCode) => {
+        const args = [binaryPath, "rule", "remove"];
+        if (target && target.length > 0) {
+            args.push(target);
+        }
+        if (desktopId && desktopId.length > 0) {
+            args.push("--desktop-id", desktopId);
+        }
+        Proc.runCommand(`${pluginId}.rmRule`, args, (stdout, exitCode) => {
             if (exitCode === 0) {
-                ToastService.showInfo(`Removed GPU rule for ${target}`);
+                ToastService.showInfo(`Removed GPU rule for ${target || desktopId}`);
                 root.refresh();
                 if (root.appsLoaded)
                     root.fetchApps("");
             } else {
-                ToastService.showError(`Failed to remove rule for ${target}`);
+                ToastService.showError(`Failed to remove rule for ${target || desktopId}`);
             }
         }, 50, 5000);
     }

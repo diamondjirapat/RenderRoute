@@ -129,6 +129,83 @@ func TestFlatpakDetectionAndEnvSanitization(t *testing.T) {
 	}
 }
 
+func TestInjectFlatpakEnvArgs(t *testing.T) {
+	intel := GPU{
+		Index:      0,
+		ID:         "0000:00:02.0",
+		Card:       "card1",
+		PCISlot:    "0000:00:02.0",
+		VendorID:   "0x8086",
+		DeviceID:   "0xa78b",
+		Vendor:     "intel",
+		Driver:     "i915",
+		Role:       RoleIntegrated,
+		VulkanICDs: []string{"/usr/share/vulkan/icd.d/intel_icd.x86_64.json"},
+		EGLVendors: []string{"/usr/share/glvnd/egl_vendor.d/50_mesa.json"},
+	}
+	nvidia := GPU{
+		Index:      1,
+		ID:         "0000:01:00.0",
+		Card:       "card0",
+		PCISlot:    "0000:01:00.0",
+		VendorID:   "0x10de",
+		DeviceID:   "0x28e1",
+		Vendor:     "nvidia",
+		Driver:     "nvidia",
+		Role:       RoleDiscrete,
+		VulkanICDs: []string{"/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json"},
+		EGLVendors: []string{"/usr/share/glvnd/egl_vendor.d/10_nvidia.json"},
+	}
+	all := []GPU{intel, nvidia}
+
+	// Targeting Intel iGPU on x86_64 Flatpak must inject sandbox Mesa EGL + Intel Vulkan ICDs and unset NVIDIA offload vars
+	igpuRouting := BuildRoutingEnv(intel, all)
+	orig := []string{"/usr/bin/flatpak", "run", "--branch=stable", "--arch=x86_64", "app.zen_browser.zen"}
+	got := InjectFlatpakEnvArgs(orig, igpuRouting, map[string]string{"EXTRA_VAR": "1"})
+
+	if got[0] != "/usr/bin/flatpak" || got[1] != "run" {
+		t.Fatalf("unexpected prefix: %v", got[:2])
+	}
+	if got[len(got)-1] != "app.zen_browser.zen" {
+		t.Fatalf("expected app ID preserved at end, got %v", got)
+	}
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{
+		"--env=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/lib/x86_64-linux-gnu/GL/glvnd/egl_vendor.d/50_mesa.json:/usr/lib/i386-linux-gnu/GL/glvnd/egl_vendor.d/50_mesa.json",
+		"--env=VK_DRIVER_FILES=/usr/lib/x86_64-linux-gnu/GL/vulkan/icd.d/intel_icd.x86_64.json:/usr/lib/x86_64-linux-gnu/GL/vulkan/icd.d/intel_hasvk_icd.x86_64.json:/usr/lib/i386-linux-gnu/GL/vulkan/icd.d/intel_icd.i686.json:/usr/lib/i386-linux-gnu/GL/vulkan/icd.d/intel_hasvk_icd.i686.json",
+		"--env=DRI_PRIME=pci-0000_00_02_0",
+		"--env=EXTRA_VAR=1",
+		"--unset-env=__NV_PRIME_RENDER_OFFLOAD",
+		"--unset-env=CUDA_VISIBLE_DEVICES",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing expected flatpak arg %q in:\n%s", want, joined)
+		}
+	}
+
+	// Targeting NVIDIA dGPU on aarch64 Flatpak must inject aarch64 nvidia_icd.json and 10_nvidia.json
+	nvRouting := BuildRoutingEnv(nvidia, all)
+	gotNV := InjectFlatpakEnvArgs([]string{"flatpak", "run", "--arch=aarch64", "dev.vencord.Vesktop"}, nvRouting, nil)
+	joinedNV := strings.Join(gotNV, "\n")
+	for _, want := range []string{
+		"--env=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/lib/aarch64-linux-gnu/GL/glvnd/egl_vendor.d/10_nvidia.json",
+		"--env=VK_DRIVER_FILES=/usr/lib/aarch64-linux-gnu/GL/vulkan/icd.d/nvidia_icd.json",
+		"--env=__NV_PRIME_RENDER_OFFLOAD=1",
+		"--unset-env=DRI_PRIME",
+	} {
+		if !strings.Contains(joinedNV, want) {
+			t.Errorf("missing expected NVIDIA flatpak arg %q in:\n%s", want, joinedNV)
+		}
+	}
+
+	// Non-flatpak command must be returned unchanged
+	native := []string{"/usr/bin/dolphin", "%u"}
+	gotNative := InjectFlatpakEnvArgs(native, igpuRouting, nil)
+	if len(gotNative) != len(native) || gotNative[0] != native[0] {
+		t.Errorf("non-flatpak argv was modified: %v", gotNative)
+	}
+}
+
 func toMap(env []string) map[string]string {
 	m := make(map[string]string, len(env))
 	for _, e := range env {

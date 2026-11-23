@@ -50,3 +50,25 @@ func TestConfigPersistenceAndRuleMatching(t *testing.T) {
 		t.Errorf("expected 0 rules after removal")
 	}
 }
+
+func TestSetRuleDeduplicatesByDesktopID(t *testing.T) {
+	cfg := Default()
+	cfg.SetRule(Rule{
+		Target:    "zed-editor",
+		GPU:       "igpu",
+		DesktopID: "dev.zed.Zed",
+	})
+	cfg.SetRule(Rule{
+		Target:    "dev.zed.Zed",
+		GPU:       "dgpu",
+		DesktopID: "dev.zed.Zed",
+	})
+
+	rules := cfg.SortedRules()
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 deduplicated rule for dev.zed.Zed, got %+v", rules)
+	}
+	if rules[0].Target != "dev.zed.zed" || rules[0].GPU != "dgpu" {
+		t.Errorf("unexpected deduplicated rule: %+v", rules[0])
+	}
+}

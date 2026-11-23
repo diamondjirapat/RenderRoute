@@ -116,7 +116,8 @@ func NormalizeKey(target string) string {
 	return strings.ToLower(t)
 }
 
-// SetRule inserts or updates a rule.
+// SetRule inserts or updates a rule. If another rule shares the same DesktopID,
+// it is replaced so conflicting rules for the same desktop application do not accumulate.
 func (c *Config) SetRule(rule Rule) {
 	if c.Rules == nil {
 		c.Rules = map[string]Rule{}
@@ -125,6 +126,17 @@ func (c *Config) SetRule(rule Rule) {
 	rule.Target = key
 	if rule.DisplayName == "" {
 		rule.DisplayName = key
+	}
+	if rule.DesktopID != "" {
+		normDesktop := NormalizeKey(rule.DesktopID)
+		for k, existing := range c.Rules {
+			if k == key {
+				continue
+			}
+			if (existing.DesktopID != "" && NormalizeKey(existing.DesktopID) == normDesktop) || k == normDesktop {
+				delete(c.Rules, k)
+			}
+		}
 	}
 	c.Rules[key] = rule
 }

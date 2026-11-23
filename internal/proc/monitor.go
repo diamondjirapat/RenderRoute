@@ -24,6 +24,7 @@ type GPUProcess struct {
 	Name        string   `json:"name"`
 	Exe         string   `json:"exe,omitempty"`
 	Cmdline     string   `json:"cmdline,omitempty"`
+	DesktopID   string   `json:"desktop_id,omitempty"`
 	GPUID       string   `json:"gpu_id"`
 	GPUName     string   `json:"gpu_name"`
 	GPUShort    string   `json:"gpu_short"`
@@ -104,6 +105,8 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 
 			matchedGPUs := map[string]gpu.GPU{}
 			vramByGPU := map[string]float64{}
+			hasDRMActivity := map[string]bool{}
+			hasNvidiaCharDev := false
 
 			for _, fd := range fds {
 				target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
@@ -112,6 +115,10 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 				}
 				// Strip " (deleted)" suffix if present
 				target = strings.TrimSuffix(target, " (deleted)")
+
+				if strings.HasPrefix(target, "/dev/nvidia") {
+					hasNvidiaCharDev = true
+				}
 
 				var matched gpu.GPU
 				ok := false
@@ -132,6 +139,10 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 					if ok {
 						if mb, hasMem := parseDRMMemoryMB(fdInfo); hasMem && mb > vramByGPU[matched.ID] {
 							vramByGPU[matched.ID] = mb
+							hasDRMActivity[matched.ID] = true
+						}
+						if hasActiveDRMEngine(fdInfo) {
+							hasDRMActivity[matched.ID] = true
 						}
 					}
 				}
@@ -149,14 +160,23 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 			if shouldSkipNoiseProcess(name) {
 				continue
 			}
+			desktopID := detectProcessDesktopID(pidDir, exe, cmdline)
 
 			for gpuID, g := range matchedGPUs {
+				// On proprietary NVIDIA drivers, real GPU contexts always open /dev/nvidia* character
+				// devices (or are reported by nvidia-smi below). A process holding ONLY a leaked
+				// non-CLOEXEC /dev/dri/renderD* FD (inherited from a launcher/compositor/terminal)
+				// without any /dev/nvidia* FD or DRM activity is not actually using the NVIDIA GPU.
+				if g.Driver == "nvidia" && !hasNvidiaCharDev && !hasDRMActivity[gpuID] {
+					continue
+				}
 				k := key{pid: pid, gpuID: gpuID}
 				p := &GPUProcess{
 					PID:         pid,
 					Name:        name,
 					Exe:         exe,
 					Cmdline:     cmdline,
+					DesktopID:   desktopID,
 					GPUID:       g.ID,
 					GPUName:     g.Name,
 					GPUShort:    g.ShortName,
@@ -199,11 +219,13 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 			if shouldSkipNoiseProcess(name) {
 				continue
 			}
+			desktopID := detectProcessDesktopID(pidDir, exe, cmdline)
 			p := &GPUProcess{
 				PID:         np.pid,
 				Name:        name,
 				Exe:         exe,
 				Cmdline:     cmdline,
+				DesktopID:   desktopID,
 				GPUID:       np.gpu.ID,
 				GPUName:     np.gpu.Name,
 				GPUShort:    np.gpu.ShortName,
@@ -223,7 +245,7 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 	out := make([]GPUProcess, 0, len(found))
 	for _, p := range found {
 		if cfg != nil {
-			if rule, ok := cfg.MatchRule(p.Name, p.Exe); ok {
+			if rule, ok := cfg.MatchRule(p.Name, p.Exe, p.DesktopID); ok {
 				p.RuleGPU = rule.GPU
 				if resolved, err := gpu.Resolve(gpus, rule.GPU); err == nil {
 					matches := resolved.ID == p.GPUID
@@ -431,6 +453,134 @@ func readProcMeta(pidDir string, myUID int) (name, exe, cmdline string, owned bo
 	return name, exe, cmdline, owned
 }
 
+func hasActiveDRMEngine(info map[string]string) bool {
+	for k, v := range info {
+		if !strings.HasPrefix(k, "drm-engine-") {
+			continue
+		}
+		fields := strings.Fields(v)
+		if len(fields) == 0 {
+			continue
+		}
+		if val, err := strconv.ParseFloat(fields[0], 64); err == nil && val > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// detectProcessDesktopID attempts to identify the desktop/Flatpak application ID owning a process
+// using /proc/<pid> metadata (FLATPAK_ID, .flatpak-info, cgroup, exe/cmdline paths).
+func detectProcessDesktopID(pidDir, exe, cmdline string) string {
+	// 1. Check /proc/<pid>/environ for FLATPAK_ID or FLATPAK_XDG_*_HOME=/.var/app/<id>/
+	if rawEnv, err := os.ReadFile(filepath.Join(pidDir, "environ")); err == nil && len(rawEnv) > 0 {
+		var varAppID string
+		for _, entry := range bytes.Split(rawEnv, []byte{0}) {
+			s := string(entry)
+			if strings.HasPrefix(s, "FLATPAK_ID=") {
+				if id := strings.TrimSpace(strings.TrimPrefix(s, "FLATPAK_ID=")); id != "" {
+					return id
+				}
+			}
+			if varAppID == "" && strings.HasPrefix(s, "FLATPAK_XDG_") {
+				if _, val, ok := strings.Cut(s, "="); ok {
+					varAppID = extractFlatpakIDFromPath(val)
+				}
+			}
+		}
+		if varAppID != "" {
+			return varAppID
+		}
+	}
+
+	// 2. Check /proc/<pid>/root/.flatpak-info ([Application] name=<id>)
+	if b, err := os.ReadFile(filepath.Join(pidDir, "root", ".flatpak-info")); err == nil && len(b) > 0 {
+		inApp := false
+		for _, line := range strings.Split(string(b), "\n") {
+			t := strings.TrimSpace(line)
+			if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+				inApp = t == "[Application]"
+				continue
+			}
+			if inApp && strings.HasPrefix(t, "name=") {
+				if id := strings.TrimSpace(strings.TrimPrefix(t, "name=")); id != "" {
+					return id
+				}
+			}
+		}
+	}
+
+	// 3. Check /proc/<pid>/cgroup for Flatpak scope (app-flatpak-<id>-<rand>.scope)
+	if b, err := os.ReadFile(filepath.Join(pidDir, "cgroup")); err == nil && len(b) > 0 {
+		if id := extractFlatpakIDFromCgroup(string(b)); id != "" {
+			return id
+		}
+	}
+
+	// 4. Check exe and cmdline for /flatpak/app/<id>/ or /.var/app/<id>/
+	if id := extractFlatpakIDFromPath(exe); id != "" {
+		return id
+	}
+	if id := extractFlatpakIDFromPath(cmdline); id != "" {
+		return id
+	}
+	return ""
+}
+
+func extractFlatpakIDFromCgroup(cgroupContent string) string {
+	for _, line := range strings.Split(cgroupContent, "\n") {
+		idx := strings.Index(line, "app-flatpak-")
+		if idx < 0 {
+			continue
+		}
+		rest := line[idx+len("app-flatpak-"):]
+		rest = strings.TrimSuffix(strings.TrimSpace(rest), ".scope")
+		// Strip trailing -<instanceID> (digits or hex/random suffix)
+		if dash := strings.LastIndex(rest, "-"); dash > 0 {
+			rest = rest[:dash]
+		}
+		rest = unescapeSystemdUnit(rest)
+		if strings.Contains(rest, ".") {
+			return rest
+		}
+	}
+	return ""
+}
+
+func unescapeSystemdUnit(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) && s[i+1] == 'x' {
+			if v, err := strconv.ParseUint(s[i+2:i+4], 16, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func extractFlatpakIDFromPath(s string) string {
+	for _, marker := range []string{"/flatpak/app/", "/.var/app/"} {
+		idx := strings.Index(s, marker)
+		if idx < 0 {
+			continue
+		}
+		rest := s[idx+len(marker):]
+		end := strings.IndexAny(rest, "/ \t\n:")
+		if end > 0 {
+			rest = rest[:end]
+		}
+		rest = strings.TrimSpace(rest)
+		if strings.Contains(rest, ".") {
+			return rest
+		}
+	}
+	return ""
+}
+
 func shouldSkipNoiseProcess(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", "nvidia-smi", "renderroute":
@@ -481,14 +631,23 @@ func RelaunchProcess(pid int, target gpu.GPU, allGPUs []gpu.GPU, extraEnv map[st
 	exePath, _ := os.Readlink(filepath.Join(pidDir, "exe"))
 	exePath = strings.TrimSuffix(exePath, " (deleted)")
 	cwd, _ := os.Readlink(filepath.Join(pidDir, "cwd"))
+	desktopID := detectProcessDesktopID(pidDir, exePath, strings.Join(argv, " "))
 
-	// Resolve binary path
+	// Resolve binary path; for Flatpak sandboxed processes (whose /app/... path does not exist on host),
+	// relaunch cleanly via `flatpak run <app-id>`.
 	bin := argv[0]
 	if !filepath.IsAbs(bin) {
 		if resolved, err := exec.LookPath(bin); err == nil {
 			bin = resolved
 		} else if exePath != "" {
 			bin = exePath
+		}
+	}
+	if _, statErr := os.Stat(bin); statErr != nil && desktopID != "" {
+		if flatpakBin, err := exec.LookPath("flatpak"); err == nil {
+			argv = []string{flatpakBin, "run", desktopID}
+			bin = flatpakBin
+			cwd = ""
 		}
 	}
 
@@ -517,6 +676,8 @@ func RelaunchProcess(pid int, target gpu.GPU, allGPUs []gpu.GPU, extraEnv map[st
 
 	routing := gpu.BuildRoutingEnv(target, allGPUs)
 	if gpu.IsFlatpakCommand(argv) {
+		argv = gpu.InjectFlatpakEnvArgs(argv, routing, extraEnv)
+		bin = argv[0]
 		routing = routing.ForFlatpak()
 	}
 	cmd := exec.Command(bin, argv[1:]...)

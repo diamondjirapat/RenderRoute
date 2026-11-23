@@ -144,3 +144,129 @@ Exec=/usr/bin/ghostty --gtk-single-instance=false
 		t.Errorf("expected action Exec= to be restored cleanly:\n%s", restored)
 	}
 }
+
+func TestFindAppMatchesProcessNamesAndFlatpak(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"dev.zed.Zed.desktop": `[Desktop Entry]
+Type=Application
+Name=Zed
+Exec=/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=zed-wrapper --file-forwarding dev.zed.Zed @@u %U @@
+X-Flatpak=dev.zed.Zed
+`,
+		"dev.vencord.Vesktop.desktop": `[Desktop Entry]
+Type=Application
+Name=Vesktop
+Exec=/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=startvesktop --file-forwarding dev.vencord.Vesktop @@u %U @@
+StartupWMClass=vesktop
+X-Flatpak=dev.vencord.Vesktop
+`,
+		"app.zen_browser.zen.desktop": `[Desktop Entry]
+Type=Application
+Name=Zen Browser
+Exec=/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=launch-script.sh --file-forwarding app.zen_browser.zen @@u %u @@
+StartupWMClass=zen
+X-Flatpak=app.zen_browser.zen
+`,
+		"com.github.wwmm.easyeffects.desktop": `[Desktop Entry]
+Type=Application
+Name=Easy Effects
+Exec=/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=easyeffects com.github.wwmm.easyeffects
+X-Flatpak=com.github.wwmm.easyeffects
+`,
+	}
+	for name, content := range files {
+		_ = os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644)
+	}
+
+	apps := DiscoverAppsFrom([]string{dir}, nil, "")
+	cases := map[string]string{
+		"zed-editor":  "dev.zed.Zed",
+		"zed-wrapper": "dev.zed.Zed",
+		"vesktop.bin": "dev.vencord.Vesktop",
+		"zen":         "app.zen_browser.zen",
+		"easyeffects": "com.github.wwmm.easyeffects",
+	}
+	for query, wantID := range cases {
+		got, err := FindApp(apps, query)
+		if err != nil {
+			t.Errorf("FindApp(%q) failed: %v", query, err)
+			continue
+		}
+		if got.ID != wantID {
+			t.Errorf("FindApp(%q) = %q, want %q", query, got.ID, wantID)
+		}
+	}
+}
+
+func TestPatchDesktopKDERunOnDiscreteAndAutostartOverrides(t *testing.T) {
+	root := t.TempDir()
+	userDir := filepath.Join(root, "apps")
+	autostartDir := filepath.Join(root, "autostart")
+	_ = os.MkdirAll(userDir, 0o755)
+	_ = os.MkdirAll(autostartDir, 0o755)
+
+	steamDesktop := `[Desktop Entry]
+Type=Application
+Name=Steam
+Exec=/usr/bin/steam %U
+PrefersNonDefaultGPU=true
+X-KDE-RunOnDiscreteGpu=true
+`
+	_ = os.WriteFile(filepath.Join(userDir, "steam.desktop"), []byte(steamDesktop), 0o644)
+
+	dst, err := ApplyDesktopOverrideIn([]string{userDir}, userDir, "steam", "igpu", "/usr/bin/renderroute", gpu.RoleIntegrated)
+	if err != nil {
+		t.Fatalf("ApplyDesktopOverrideIn failed: %v", err)
+	}
+	patchedRaw, _ := os.ReadFile(dst)
+	patched := string(patchedRaw)
+	if !strings.Contains(patched, "PrefersNonDefaultGPU=false") {
+		t.Errorf("expected PrefersNonDefaultGPU=false:\n%s", patched)
+	}
+	if !strings.Contains(patched, "X-KDE-RunOnDiscreteGpu=false") {
+		t.Errorf("expected X-KDE-RunOnDiscreteGpu=false:\n%s", patched)
+	}
+
+	changed, err := ResetDesktopOverrideIn([]string{userDir}, userDir, "steam")
+	if err != nil || !changed {
+		t.Fatalf("ResetDesktopOverrideIn failed: changed=%v err=%v", changed, err)
+	}
+	restoredRaw, _ := os.ReadFile(dst)
+	restored := string(restoredRaw)
+	if !strings.Contains(restored, "PrefersNonDefaultGPU=true") || !strings.Contains(restored, "X-KDE-RunOnDiscreteGpu=true") {
+		t.Errorf("expected original GPU hints restored:\n%s", restored)
+	}
+
+	// Autostart override: filename differs from Flatpak app ID ("vesktop.desktop" -> dev.vencord.Vesktop)
+	vesktopAutostart := `[Desktop Entry]
+Type=Application
+Name=Vesktop
+Exec=/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=startvesktop --file-forwarding dev.vencord.Vesktop @@u %U @@
+Icon=dev.vencord.Vesktop
+`
+	autostartPath := filepath.Join(autostartDir, "vesktop.desktop")
+	_ = os.WriteFile(autostartPath, []byte(vesktopAutostart), 0o644)
+
+	patchedFiles, err := ApplyAutostartOverridesIn(autostartDir, "dev.vencord.Vesktop", "vesktop.bin", "dgpu", "/usr/bin/renderroute", gpu.RoleDiscrete)
+	if err != nil || len(patchedFiles) != 1 {
+		t.Fatalf("ApplyAutostartOverridesIn failed: files=%v err=%v", patchedFiles, err)
+	}
+	asPatched, _ := os.ReadFile(autostartPath)
+	if !strings.Contains(string(asPatched), "Exec=/usr/bin/renderroute run dgpu -- /usr/bin/flatpak run") {
+		t.Errorf("expected autostart Exec to be wrapped:\n%s", string(asPatched))
+	}
+
+	// Reset must restore in place and NOT delete the autostart file
+	resetFiles, err := ResetAutostartOverridesIn(autostartDir, "dev.vencord.Vesktop", "vesktop.bin")
+	if err != nil || len(resetFiles) != 1 {
+		t.Fatalf("ResetAutostartOverridesIn failed: files=%v err=%v", resetFiles, err)
+	}
+	asRestored, err := os.ReadFile(autostartPath)
+	if err != nil {
+		t.Fatalf("autostart file should still exist after reset: %v", err)
+	}
+	if strings.Contains(string(asRestored), "renderroute run") {
+		t.Errorf("expected autostart Exec to be unwrapped after reset:\n%s", string(asRestored))
+	}
+}

@@ -825,7 +825,7 @@ PluginComponent {
                                                         onClicked: RenderRouteService.setRule(
                                                             procCard.procData.name,
                                                             targetSel,
-                                                            "",
+                                                            procCard.procData.desktop_id || "",
                                                             procCard.procData.name,
                                                             RenderRouteService.autoPatchDesktop
                                                         )
@@ -1058,7 +1058,10 @@ PluginComponent {
                                                     label: "Unpin"
                                                     iconName: "close"
                                                     danger: true
-                                                    onClicked: RenderRouteService.removeRule(appCard.appData.binary || appCard.appData.id)
+                                                    onClicked: RenderRouteService.removeRule(
+                                                        appCard.appData.binary || appCard.appData.id,
+                                                        appCard.appData.id || ""
+                                                    )
                                                 }
                                             }
                                         }

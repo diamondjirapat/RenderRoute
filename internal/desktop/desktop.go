@@ -25,12 +25,16 @@ type App struct {
 	Icon           string `json:"icon,omitempty"`           // Icon name or path
 	Exec           string `json:"exec"`                     // Raw Exec= string (unwrapped)
 	Binary         string `json:"binary"`                   // Primary executable basename
+	TryExec        string `json:"try_exec,omitempty"`       // TryExec basename if present
+	StartupWMClass string `json:"startup_wm_class,omitempty"`
+	FlatpakID      string `json:"flatpak_id,omitempty"`     // X-Flatpak app ID if present
+	FlatpakCommand string `json:"flatpak_command,omitempty"` // --command= value from flatpak run if present
 	Path           string `json:"path"`                     // Active .desktop file path
 	Categories     string `json:"categories,omitempty"`
 	Terminal       bool   `json:"terminal,omitempty"`
-	PatchedGPU     string `json:"patched_gpu,omitempty"`    // GPU selector if .desktop override is active
-	RuleGPU        string `json:"rule_gpu,omitempty"`       // GPU selector from config rules
-	EffectiveGPU   string `json:"effective_gpu,omitempty"`  // Combined GPU preference
+	PatchedGPU     string `json:"patched_gpu,omitempty"`   // GPU selector if .desktop override is active
+	RuleGPU        string `json:"rule_gpu,omitempty"`      // GPU selector from config rules
+	EffectiveGPU   string `json:"effective_gpu,omitempty"` // Combined GPU preference
 }
 
 // ApplicationDirs returns XDG application directories in precedence order (user overrides first).
@@ -65,6 +69,18 @@ func UserApplicationsDir() (string, error) {
 	return filepath.Join(home, ".local", "share", "applications"), nil
 }
 
+// UserAutostartDir returns ~/.config/autostart (or $XDG_CONFIG_HOME/autostart).
+func UserAutostartDir() (string, error) {
+	if xdgCfg := os.Getenv("XDG_CONFIG_HOME"); xdgCfg != "" {
+		return filepath.Join(xdgCfg, "autostart"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "autostart"), nil
+}
+
 // DiscoverApps lists visible desktop applications, respecting user overrides over system entries.
 func DiscoverApps(cfg *config.Config, query string) []App {
 	return DiscoverAppsFrom(ApplicationDirs(), cfg, query)
@@ -97,7 +113,7 @@ func DiscoverAppsFrom(dirs []string, cfg *config.Config, query string) []App {
 			seen[id] = true
 
 			if cfg != nil {
-				if r, matched := cfg.MatchRule(app.ID, app.Binary); matched {
+				if r, matched := cfg.MatchRule(app.ID, app.Binary, app.FlatpakID, app.StartupWMClass, app.FlatpakCommand); matched {
 					app.RuleGPU = r.GPU
 				}
 			}
@@ -185,6 +201,12 @@ func parseDesktopFile(id, path string) (App, bool) {
 			app.Icon = v
 		case "Exec":
 			app.Exec = v
+		case "TryExec":
+			app.TryExec = filepath.Base(v)
+		case "StartupWMClass":
+			app.StartupWMClass = v
+		case "X-Flatpak":
+			app.FlatpakID = v
 		case "Categories":
 			app.Categories = v
 		case "Terminal":
@@ -210,32 +232,102 @@ func parseDesktopFile(id, path string) (App, bool) {
 		app.Exec = UnwrapExec(app.Exec)
 	}
 	app.Binary = extractPrimaryBinary(app.Exec)
+	app.FlatpakCommand = extractFlatpakCommand(app.Exec)
 	return app, true
 }
 
-// FindApp finds an app by exact ID, case-insensitive ID, exact Name, or binary name.
+// FindApp finds an app by exact ID/FlatpakID, exact Name/Binary/StartupWMClass/TryExec/FlatpakCommand,
+// normalized executable stem (e.g. "vesktop.bin" -> "vesktop", "zed-editor" -> "zed"),
+// or substring fallback.
 func FindApp(apps []App, query string) (*App, error) {
 	q := strings.TrimSpace(strings.TrimSuffix(query, ".desktop"))
 	if q == "" {
 		return nil, errors.New("empty app identifier")
 	}
+	if strings.Contains(q, "/") {
+		q = filepath.Base(q)
+	}
 	low := strings.ToLower(q)
+
+	// Tier 1: exact ID or X-Flatpak match
 	for i := range apps {
-		if strings.EqualFold(apps[i].ID, q) {
+		if strings.EqualFold(apps[i].ID, q) ||
+			(apps[i].FlatpakID != "" && strings.EqualFold(apps[i].FlatpakID, q)) {
 			return &apps[i], nil
 		}
 	}
+
+	// Tier 2: exact Name, Binary, StartupWMClass, TryExec, FlatpakCommand, or reverse-DNS leaf
 	for i := range apps {
-		if strings.ToLower(apps[i].Name) == low || strings.ToLower(apps[i].Binary) == low {
+		if appMatchesExactToken(apps[i], low) {
 			return &apps[i], nil
 		}
 	}
+
+	// Tier 3: stripped executable stem (e.g. "vesktop.bin" -> "vesktop", "zed-editor" -> "zed")
+	if stem := stripProcessSuffix(low); stem != "" && stem != low {
+		for i := range apps {
+			if appMatchesExactToken(apps[i], stem) {
+				return &apps[i], nil
+			}
+		}
+	}
+
+	// Tier 4: substring match on ID or Name
 	for i := range apps {
 		if strings.Contains(strings.ToLower(apps[i].ID), low) || strings.Contains(strings.ToLower(apps[i].Name), low) {
 			return &apps[i], nil
 		}
 	}
 	return nil, fmt.Errorf("desktop application %q not found", query)
+}
+
+func appMatchesExactToken(app App, low string) bool {
+	if low == "" {
+		return false
+	}
+	if strings.ToLower(app.Name) == low ||
+		strings.ToLower(app.Binary) == low ||
+		strings.ToLower(app.StartupWMClass) == low ||
+		strings.ToLower(app.TryExec) == low ||
+		strings.ToLower(app.FlatpakCommand) == low {
+		return true
+	}
+	if leaf := reverseDNSLeaf(app.ID); leaf != "" && leaf == low {
+		return true
+	}
+	if leaf := reverseDNSLeaf(app.FlatpakID); leaf != "" && leaf == low {
+		return true
+	}
+	return false
+}
+
+func reverseDNSLeaf(id string) string {
+	id = strings.TrimSpace(strings.TrimSuffix(id, ".desktop"))
+	if !strings.Contains(id, ".") {
+		return ""
+	}
+	parts := strings.Split(id, ".")
+	last := strings.ToLower(strings.TrimSpace(parts[len(parts)-1]))
+	if len(last) < 2 {
+		return ""
+	}
+	return last
+}
+
+func stripProcessSuffix(name string) string {
+	s := strings.ToLower(strings.TrimSpace(name))
+	for _, suf := range []string{
+		".bin", "-bin", ".exe",
+		"-editor", "-wrapper", "-wrapped",
+		"-desktop", "-browser", "-client",
+		"-gtk", "-qt", "-wayland", "-x11",
+	} {
+		if strings.HasSuffix(s, suf) && len(s) > len(suf)+1 {
+			return strings.TrimSuffix(s, suf)
+		}
+	}
+	return s
 }
 
 // UnwrapExec strips any existing "renderroute run <gpu> -- " prefix from an Exec= value.
@@ -271,7 +363,11 @@ func ApplyDesktopOverride(appID, gpuSelector, renderrouteBin string, targetRole 
 	if err != nil {
 		return "", err
 	}
-	return ApplyDesktopOverrideIn(ApplicationDirs(), userDir, appID, gpuSelector, renderrouteBin, targetRole)
+	dst, err := ApplyDesktopOverrideIn(ApplicationDirs(), userDir, appID, gpuSelector, renderrouteBin, targetRole)
+	if err == nil {
+		refreshDesktopDatabase(userDir)
+	}
+	return dst, err
 }
 
 // ApplyDesktopOverrideIn performs the .desktop patch against custom search/output dirs (for testing).
@@ -320,6 +416,8 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 	wrotePrefers := false
 	var origExec string
 	origDBusActivatable := false
+	origPrefers := ""
+	origKDERunDiscrete := ""
 
 	// First pass: preserve original metadata if re-patching an already managed file
 	for _, l := range lines {
@@ -333,6 +431,10 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 				if strings.EqualFold(val, "true") {
 					origDBusActivatable = true
 				}
+			case "X-RenderRoute-Original-PrefersNonDefaultGPU":
+				origPrefers = val
+			case "X-RenderRoute-Original-KDE-RunOnDiscreteGpu":
+				origKDERunDiscrete = val
 			}
 		}
 	}
@@ -356,6 +458,12 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 		}
 		if origDBusActivatable {
 			out = append(out, "X-RenderRoute-Original-DBusActivatable=true")
+		}
+		if origPrefers != "" {
+			out = append(out, "X-RenderRoute-Original-PrefersNonDefaultGPU="+origPrefers)
+		}
+		if origKDERunDiscrete != "" {
+			out = append(out, "X-RenderRoute-Original-KDE-RunOnDiscreteGpu="+origKDERunDiscrete)
 		}
 		wroteMeta = true
 	}
@@ -384,11 +492,24 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 				key := strings.TrimSpace(k)
 				val := strings.TrimSpace(v)
 				switch key {
-				case "X-RenderRoute-GPU", "X-RenderRoute-Original-Exec", "X-RenderRoute-Original-DBusActivatable":
+				case "X-RenderRoute-GPU",
+					"X-RenderRoute-Original-Exec",
+					"X-RenderRoute-Original-DBusActivatable",
+					"X-RenderRoute-Original-PrefersNonDefaultGPU",
+					"X-RenderRoute-Original-KDE-RunOnDiscreteGpu":
 					continue
 				case "PrefersNonDefaultGPU":
+					if origPrefers == "" && !strings.Contains(content, "X-RenderRoute-GPU=") {
+						origPrefers = val
+					}
 					out = append(out, "PrefersNonDefaultGPU="+prefersVal)
 					wrotePrefers = true
+					continue
+				case "X-KDE-RunOnDiscreteGpu":
+					if origKDERunDiscrete == "" && !strings.Contains(content, "X-RenderRoute-GPU=") {
+						origKDERunDiscrete = val
+					}
+					out = append(out, "X-KDE-RunOnDiscreteGpu="+prefersVal)
 					continue
 				case "DBusActivatable":
 					// D-Bus activation bypasses Exec= completely; disable it so launchers invoke RenderRoute.
@@ -431,7 +552,11 @@ func ResetDesktopOverride(appID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return ResetDesktopOverrideIn(ApplicationDirs(), userDir, appID)
+	changed, err := ResetDesktopOverrideIn(ApplicationDirs(), userDir, appID)
+	if err == nil && changed {
+		refreshDesktopDatabase(userDir)
+	}
+	return changed, err
 }
 
 // ResetDesktopOverrideIn resets an override with custom search/user directories (for testing).
@@ -482,6 +607,8 @@ func unpatchDesktopContent(content string) string {
 	lines := strings.Split(content, "\n")
 	var origExec string
 	origDBusActivatable := false
+	origPrefers := ""
+	origKDERunDiscrete := ""
 	for _, l := range lines {
 		if k, v, ok := strings.Cut(strings.TrimSpace(l), "="); ok {
 			key := strings.TrimSpace(k)
@@ -493,6 +620,10 @@ func unpatchDesktopContent(content string) string {
 				if strings.EqualFold(val, "true") {
 					origDBusActivatable = true
 				}
+			case "X-RenderRoute-Original-PrefersNonDefaultGPU":
+				origPrefers = val
+			case "X-RenderRoute-Original-KDE-RunOnDiscreteGpu":
+				origKDERunDiscrete = val
 			}
 		}
 	}
@@ -515,8 +646,22 @@ func unpatchDesktopContent(content string) string {
 				key := strings.TrimSpace(k)
 				val := strings.TrimSpace(v)
 				switch key {
-				case "X-RenderRoute-GPU", "X-RenderRoute-Original-Exec", "X-RenderRoute-Original-DBusActivatable":
+				case "X-RenderRoute-GPU",
+					"X-RenderRoute-Original-Exec",
+					"X-RenderRoute-Original-DBusActivatable",
+					"X-RenderRoute-Original-PrefersNonDefaultGPU",
+					"X-RenderRoute-Original-KDE-RunOnDiscreteGpu":
 					continue
+				case "PrefersNonDefaultGPU":
+					if origPrefers != "" {
+						out = append(out, "PrefersNonDefaultGPU="+origPrefers)
+					}
+					continue
+				case "X-KDE-RunOnDiscreteGpu":
+					if origKDERunDiscrete != "" {
+						out = append(out, "X-KDE-RunOnDiscreteGpu="+origKDERunDiscrete)
+						continue
+					}
 				case "DBusActivatable":
 					if origDBusActivatable {
 						out = append(out, "DBusActivatable=true")
@@ -542,6 +687,167 @@ func unpatchDesktopContent(content string) string {
 	return strings.TrimLeft(strings.Join(out, "\n"), "\n")
 }
 
+// ApplyAutostartOverrides patches any matching ~/.config/autostart/*.desktop files in place
+// so autostarted applications honor the pinned GPU rule on login.
+func ApplyAutostartOverrides(appID, targetBinary, gpuSelector, renderrouteBin string, targetRole gpu.Role) ([]string, error) {
+	dir, err := UserAutostartDir()
+	if err != nil {
+		return nil, err
+	}
+	return ApplyAutostartOverridesIn(dir, appID, targetBinary, gpuSelector, renderrouteBin, targetRole)
+}
+
+// ApplyAutostartOverridesIn patches matching autostart .desktop files inside autostartDir (for testing).
+func ApplyAutostartOverridesIn(autostartDir, appID, targetBinary, gpuSelector, renderrouteBin string, targetRole gpu.Role) ([]string, error) {
+	matches, err := findMatchingAutostartFiles(autostartDir, appID, targetBinary)
+	if err != nil || len(matches) == 0 {
+		return nil, err
+	}
+	var patched []string
+	for _, path := range matches {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		updated := patchDesktopContent(string(raw), gpuSelector, renderrouteBin, targetRole)
+		if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
+			return patched, err
+		}
+		patched = append(patched, path)
+	}
+	return patched, nil
+}
+
+// ResetAutostartOverrides restores any RenderRoute-patched ~/.config/autostart/*.desktop files in place
+// without removing the user's autostart entries.
+func ResetAutostartOverrides(appID, targetBinary string) ([]string, error) {
+	dir, err := UserAutostartDir()
+	if err != nil {
+		return nil, err
+	}
+	return ResetAutostartOverridesIn(dir, appID, targetBinary)
+}
+
+// ResetAutostartOverridesIn restores matching patched autostart files inside autostartDir (for testing).
+func ResetAutostartOverridesIn(autostartDir, appID, targetBinary string) ([]string, error) {
+	matches, err := findMatchingAutostartFiles(autostartDir, appID, targetBinary)
+	if err != nil || len(matches) == 0 {
+		return nil, err
+	}
+	var reset []string
+	for _, path := range matches {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		content := string(raw)
+		if !strings.Contains(content, managedHeaderPrefix) && !strings.Contains(content, "X-RenderRoute-GPU=") {
+			continue
+		}
+		restored := unpatchDesktopContent(content)
+		if err := os.WriteFile(path, []byte(restored), 0o644); err != nil {
+			return reset, err
+		}
+		reset = append(reset, path)
+	}
+	return reset, nil
+}
+
+func findMatchingAutostartFiles(autostartDir, appID, targetBinary string) ([]string, error) {
+	entries, err := os.ReadDir(autostartDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	want := map[string]bool{}
+	addWant := func(s string) {
+		s = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(s, ".desktop")))
+		if s == "" {
+			return
+		}
+		want[s] = true
+		if leaf := reverseDNSLeaf(s); leaf != "" {
+			want[leaf] = true
+		}
+		if stem := stripProcessSuffix(s); stem != "" {
+			want[stem] = true
+		}
+	}
+	addWant(appID)
+	addWant(targetBinary)
+	if len(want) == 0 {
+		return nil, nil
+	}
+
+	var matched []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".desktop") {
+			continue
+		}
+		fullPath := filepath.Join(autostartDir, e.Name())
+		fileID := strings.ToLower(strings.TrimSuffix(e.Name(), ".desktop"))
+		if want[fileID] {
+			matched = append(matched, fullPath)
+			continue
+		}
+		raw, err := os.ReadFile(fullPath)
+		if err != nil {
+			continue
+		}
+		if autostartContentMatches(string(raw), want) {
+			matched = append(matched, fullPath)
+		}
+	}
+	sort.Strings(matched)
+	return matched, nil
+}
+
+func autostartContentMatches(content string, want map[string]bool) bool {
+	inEntry := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inEntry = trimmed == "[Desktop Entry]"
+			continue
+		}
+		if !inEntry {
+			continue
+		}
+		k, v, ok := strings.Cut(trimmed, "=")
+		if !ok {
+			continue
+		}
+		key := strings.TrimSpace(k)
+		val := strings.TrimSpace(v)
+		switch key {
+		case "X-Flatpak", "X-XDP-Autostart", "StartupWMClass", "Icon":
+			if want[strings.ToLower(val)] {
+				return true
+			}
+		case "Exec", "X-RenderRoute-Original-Exec":
+			unwrapped := UnwrapExec(val)
+			bin := strings.ToLower(extractPrimaryBinary(unwrapped))
+			if bin != "" && want[bin] {
+				return true
+			}
+			fpCmd := strings.ToLower(extractFlatpakCommand(unwrapped))
+			if fpCmd != "" && want[fpCmd] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func refreshDesktopDatabase(dir string) {
+	if bin, err := exec.LookPath("update-desktop-database"); err == nil {
+		_ = exec.Command(bin, dir).Run()
+	}
+}
+
 // LaunchApp spawns a .desktop application detached with the target GPU environment.
 func LaunchApp(app App, target gpu.GPU, allGPUs []gpu.GPU, extraEnv map[string]string) (int, error) {
 	argv := buildLaunchArgv(app.Exec)
@@ -551,6 +857,7 @@ func LaunchApp(app App, target gpu.GPU, allGPUs []gpu.GPU, extraEnv map[string]s
 
 	routing := gpu.BuildRoutingEnv(target, allGPUs)
 	if gpu.IsFlatpakCommand(argv) {
+		argv = gpu.InjectFlatpakEnvArgs(argv, routing, extraEnv)
 		routing = routing.ForFlatpak()
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
@@ -587,6 +894,31 @@ func buildLaunchArgv(execLine string) []string {
 		}
 	}
 	return out
+}
+
+func extractFlatpakCommand(execLine string) string {
+	tokens := SplitDesktopExec(execLine)
+	for i := 0; i < len(tokens); i++ {
+		if filepath.Base(tokens[i]) == "flatpak" && i+1 < len(tokens) && tokens[i+1] == "run" {
+			for j := i + 2; j < len(tokens); j++ {
+				tok := tokens[j]
+				if tok == "--" {
+					break
+				}
+				if strings.HasPrefix(tok, "--command=") {
+					return filepath.Base(strings.TrimPrefix(tok, "--command="))
+				}
+				if tok == "--command" && j+1 < len(tokens) {
+					return filepath.Base(tokens[j+1])
+				}
+				if !strings.HasPrefix(tok, "-") {
+					break
+				}
+			}
+			break
+		}
+	}
+	return ""
 }
 
 func extractPrimaryBinary(execLine string) string {

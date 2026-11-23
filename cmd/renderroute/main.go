@@ -19,7 +19,7 @@ import (
 	"github.com/diamondjirapat/RenderRoute/internal/proc"
 )
 
-const version = "1.0.0"
+const version = "1.0.0_dev"
 
 // StatusPayload is the unified JSON payload consumed by the DankMaterialShell widget plugin.
 type StatusPayload struct {
@@ -108,9 +108,10 @@ Usage:
       Show or set the default GPU selector.
 
   renderroute rule list [--json]
-  renderroute rule set <target> <gpu> [--desktop-id <id>] [--name <label>] [--apply-desktop]
-  renderroute rule remove <target> [--reset-desktop]
-      Manage persistent per-process / per-app GPU rules.
+  renderroute rule set <target> <gpu> [--desktop-id <id>] [--name <label>] [--apply-desktop|--no-apply-desktop]
+  renderroute rule remove <target> [--desktop-id <id>] [--reset-desktop|--no-reset-desktop]
+  renderroute rule sync
+      Manage persistent per-process / per-app GPU rules and sync .desktop/autostart overrides.
 
   renderroute apps [--search <query>] [--json]
       List installed .desktop applications and their RenderRoute GPU assignments.
@@ -431,6 +432,7 @@ func cmdRun(args []string) error {
 
 	routing := gpu.BuildRoutingEnv(*target, gpus)
 	if gpu.IsFlatpakCommand(cmdArgs) {
+		cmdArgs = gpu.InjectFlatpakEnvArgs(cmdArgs, routing, extraEnv)
 		routing = routing.ForFlatpak()
 	}
 	finalEnv := routing.Apply(os.Environ(), extraEnv)
@@ -454,6 +456,10 @@ func cmdRun(args []string) error {
 		fmt.Printf("Launched %s (pid %d) on %s (%s)\n", cmdArgs[0], pid, target.ShortName, target.ID)
 		return nil
 	}
+
+	// Close any leaked non-CLOEXEC GPU device FDs inherited from launchers/compositors
+	// (e.g. /dev/dri/renderD* or /dev/nvidia*) so they do not survive syscall.Exec into the app.
+	closeInheritedGPUFDs()
 
 	// Replace current process with target executable directly (zero wrapper overhead)
 	return syscall.Exec(binPath, cmdArgs, finalEnv)
@@ -554,6 +560,7 @@ func cmdRule(args []string) error {
 		desktopID := ""
 		displayName := ""
 		applyDesktop := false
+		noApplyDesktop := false
 		for i := 1; i < len(args); i++ {
 			switch args[i] {
 			case "--desktop-id":
@@ -570,6 +577,8 @@ func cmdRule(args []string) error {
 				displayName = args[i]
 			case "--apply-desktop":
 				applyDesktop = true
+			case "--no-apply-desktop":
+				noApplyDesktop = true
 			default:
 				pos = append(pos, args[i])
 			}
@@ -599,22 +608,44 @@ func cmdRule(args []string) error {
 			return err
 		}
 
-		patched := false
-		if applyDesktop {
+		existing, hasExisting := cfg.MatchRule(targetName, desktopID)
+		if desktopID == "" && hasExisting && existing.DesktopID != "" {
+			desktopID = existing.DesktopID
+		}
+		if displayName == "" && hasExisting && existing.DisplayName != "" {
+			displayName = existing.DisplayName
+		}
+		var extraEnv map[string]string
+		if hasExisting {
+			extraEnv = existing.ExtraEnv
+		}
+
+		patched := hasExisting && existing.DesktopPatched
+		var patchedAutostart []string
+		shouldPatch := !noApplyDesktop && (applyDesktop || (hasExisting && existing.DesktopPatched))
+		if shouldPatch {
+			patched = false
 			if desktopID == "" {
 				apps := desktop.DiscoverApps(cfg, "")
 				if found, err := desktop.FindApp(apps, targetName); err == nil {
 					desktopID = found.ID
-					if displayName == "" {
+					if displayName == "" || strings.EqualFold(displayName, targetName) {
 						displayName = found.Name
 					}
 				}
 			}
+			binPath := selfBinaryForDesktop()
 			if desktopID != "" {
-				binPath := selfBinaryForDesktop()
 				if _, err := desktop.ApplyDesktopOverride(desktopID, storedSel, binPath, resolved.Role); err == nil {
 					patched = true
+				} else {
+					fmt.Fprintf(os.Stderr, "warning: could not patch %s.desktop: %v\n", desktopID, err)
 				}
+			}
+			if autostartFiles, err := desktop.ApplyAutostartOverrides(desktopID, targetName, storedSel, binPath, resolved.Role); err == nil {
+				patchedAutostart = autostartFiles
+			} else {
+				fmt.Fprintf(os.Stderr, "warning: could not patch autostart entries for %s: %v\n", targetName, err)
 			}
 		}
 
@@ -624,6 +655,7 @@ func cmdRule(args []string) error {
 			GPU:            storedSel,
 			DesktopID:      desktopID,
 			DesktopPatched: patched,
+			ExtraEnv:       extraEnv,
 		})
 		if err := cfg.Save(); err != nil {
 			return err
@@ -632,46 +664,149 @@ func cmdRule(args []string) error {
 		if patched {
 			fmt.Printf(" [desktop override applied: %s.desktop]", desktopID)
 		}
+		if len(patchedAutostart) > 0 {
+			fmt.Printf(" [autostart patched: %d]", len(patchedAutostart))
+		}
 		fmt.Println()
 		return nil
 
 	case "remove", "rm", "delete":
 		resetDesktop := true
 		target := ""
-		for _, a := range args[1:] {
-			switch a {
+		desktopID := ""
+		for i := 1; i < len(args); i++ {
+			switch args[i] {
 			case "--no-reset-desktop":
 				resetDesktop = false
 			case "--reset-desktop":
 				resetDesktop = true
+			case "--desktop-id":
+				if i+1 >= len(args) {
+					return errors.New("--desktop-id requires a value")
+				}
+				i++
+				desktopID = args[i]
 			default:
 				if target == "" {
-					target = a
+					target = args[i]
 				}
 			}
 		}
-		if target == "" {
-			return errors.New("usage: renderroute rule remove <target>")
+		if target == "" && desktopID == "" {
+			return errors.New("usage: renderroute rule remove <target> [--desktop-id <id>]")
 		}
 		cfg, err := config.Load()
 		if err != nil {
 			return err
 		}
-		removed, ok := cfg.RemoveRule(target)
-		if !ok {
+		var removed config.Rule
+		ok := false
+		if target != "" {
+			removed, ok = cfg.RemoveRule(target)
+		}
+		if !ok && desktopID != "" {
+			removed, ok = cfg.RemoveRule(desktopID)
+		}
+		if ok {
+			if err := cfg.Save(); err != nil {
+				return err
+			}
+		}
+		resetID := removed.DesktopID
+		if resetID == "" {
+			resetID = desktopID
+		}
+		resetTarget := removed.Target
+		if resetTarget == "" {
+			resetTarget = target
+		}
+		desktopReset := false
+		if resetDesktop {
+			if resetID != "" {
+				if changed, _ := desktop.ResetDesktopOverride(resetID); changed {
+					desktopReset = true
+				}
+			}
+			if files, _ := desktop.ResetAutostartOverrides(resetID, resetTarget); len(files) > 0 {
+				desktopReset = true
+			}
+		}
+		if !ok && !desktopReset {
 			return fmt.Errorf("no rule found for %q", target)
+		}
+		if ok {
+			fmt.Printf("Removed rule for %s\n", removed.Target)
+		} else {
+			fmt.Printf("Reset desktop override for %s\n", resetID)
+		}
+		return nil
+
+	case "sync":
+		cfg, err := config.Load()
+		if err != nil {
+			return err
+		}
+		gpus, err := gpu.Discover(false)
+		if err != nil {
+			return err
+		}
+		apps := desktop.DiscoverApps(cfg, "")
+		binPath := selfBinaryForDesktop()
+		rules := cfg.SortedRules()
+		if len(rules) == 0 {
+			fmt.Println("No GPU rules configured.")
+			return nil
+		}
+		synced := 0
+		for _, r := range rules {
+			resolved, err := gpu.Resolve(gpus, r.GPU)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: rule %s -> %s: %v\n", r.Target, r.GPU, err)
+				continue
+			}
+			desktopID := r.DesktopID
+			displayName := r.DisplayName
+			if desktopID == "" {
+				if found, err := desktop.FindApp(apps, r.Target); err == nil {
+					desktopID = found.ID
+					if displayName == "" || strings.EqualFold(displayName, r.Target) {
+						displayName = found.Name
+					}
+				}
+			}
+			patched := false
+			if desktopID != "" {
+				if _, err := desktop.ApplyDesktopOverride(desktopID, r.GPU, binPath, resolved.Role); err == nil {
+					patched = true
+				} else {
+					fmt.Fprintf(os.Stderr, "warning: could not patch %s.desktop for %s: %v\n", desktopID, r.Target, err)
+				}
+			}
+			autostartFiles, _ := desktop.ApplyAutostartOverrides(desktopID, r.Target, r.GPU, binPath, resolved.Role)
+			r.DesktopID = desktopID
+			r.DisplayName = displayName
+			r.DesktopPatched = patched
+			cfg.SetRule(r)
+			if patched || len(autostartFiles) > 0 {
+				synced++
+				fmt.Printf("Synced %s -> %s", r.Target, r.GPU)
+				if patched {
+					fmt.Printf(" [%s.desktop]", desktopID)
+				}
+				if len(autostartFiles) > 0 {
+					fmt.Printf(" [autostart: %d]", len(autostartFiles))
+				}
+				fmt.Println()
+			}
 		}
 		if err := cfg.Save(); err != nil {
 			return err
 		}
-		if resetDesktop && removed.DesktopID != "" {
-			_, _ = desktop.ResetDesktopOverride(removed.DesktopID)
-		}
-		fmt.Printf("Removed rule for %s\n", removed.Target)
+		fmt.Printf("Synced %d/%d rules.\n", synced, len(rules))
 		return nil
 
 	default:
-		return fmt.Errorf("unknown rule subcommand %q (expected list, set, remove)", args[0])
+		return fmt.Errorf("unknown rule subcommand %q (expected list, set, remove, sync)", args[0])
 	}
 }
 
@@ -822,11 +957,17 @@ func cmdDesktop(args []string) error {
 		if storedSel != "igpu" && storedSel != "dgpu" {
 			storedSel = resolved.ID
 		}
-		dst, err := desktop.ApplyDesktopOverride(appID, storedSel, selfBinaryForDesktop(), resolved.Role)
+		binPath := selfBinaryForDesktop()
+		dst, err := desktop.ApplyDesktopOverride(appID, storedSel, binPath, resolved.Role)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Patched desktop launcher: %s (GPU -> %s)\n", dst, storedSel)
+		autostartFiles, _ := desktop.ApplyAutostartOverrides(appID, "", storedSel, binPath, resolved.Role)
+		fmt.Printf("Patched desktop launcher: %s (GPU -> %s)", dst, storedSel)
+		if len(autostartFiles) > 0 {
+			fmt.Printf(" [autostart patched: %d]", len(autostartFiles))
+		}
+		fmt.Println()
 		return nil
 
 	case "reset":
@@ -835,7 +976,8 @@ func cmdDesktop(args []string) error {
 		if err != nil {
 			return err
 		}
-		if changed {
+		autostartFiles, _ := desktop.ResetAutostartOverrides(appID, "")
+		if changed || len(autostartFiles) > 0 {
 			fmt.Printf("Reset RenderRoute override for %s.desktop\n", strings.TrimSuffix(appID, ".desktop"))
 		} else {
 			fmt.Printf("No RenderRoute override found for %s.desktop\n", strings.TrimSuffix(appID, ".desktop"))
@@ -989,6 +1131,27 @@ func resolveWithConfigAndWarnings(gpus []gpu.GPU, cfg *config.Config, selector s
 		return nil, gpu.FormatResolveError(selector, err, warnings)
 	}
 	return g, nil
+}
+
+func closeInheritedGPUFDs() {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		fd, err := strconv.Atoi(e.Name())
+		if err != nil || fd < 3 {
+			continue
+		}
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name()))
+		if err != nil {
+			continue
+		}
+		target = strings.TrimSuffix(target, " (deleted)")
+		if strings.HasPrefix(target, "/dev/dri/") || strings.HasPrefix(target, "/dev/nvidia") {
+			_ = syscall.Close(fd)
+		}
+	}
 }
 
 func selfBinaryForDesktop() string {
