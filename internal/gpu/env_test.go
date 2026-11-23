@@ -206,6 +206,64 @@ func TestInjectFlatpakEnvArgs(t *testing.T) {
 	}
 }
 
+func TestFlatpakAppIDAndZedNoEscape(t *testing.T) {
+	cases := []struct {
+		argv []string
+		want string
+	}{
+		{
+			argv: []string{"/usr/bin/flatpak", "run", "--branch=stable", "--arch=x86_64", "--command=zed-wrapper", "--file-forwarding", "dev.zed.Zed", "@@u", "%U", "@@"},
+			want: "dev.zed.Zed",
+		},
+		{
+			argv: []string{"env", "FOO=1", "flatpak", "run", "--command", "startvesktop", "dev.vencord.Vesktop/x86_64/stable"},
+			want: "dev.vencord.Vesktop",
+		},
+		{
+			argv: []string{"/usr/bin/dolphin", "%u"},
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		if got := FlatpakAppID(tc.argv); got != tc.want {
+			t.Errorf("FlatpakAppID(%v) = %q, want %q", tc.argv, got, tc.want)
+		}
+	}
+
+	intel := GPU{
+		Index:    0,
+		ID:       "0000:00:02.0",
+		Card:     "card1",
+		PCISlot:  "0000:00:02.0",
+		VendorID: "0x8086",
+		DeviceID: "0xa78b",
+		Vendor:   "intel",
+		Driver:   "i915",
+		Role:     RoleIntegrated,
+	}
+	routing := BuildRoutingEnv(intel, []GPU{intel})
+
+	// Zed Flatpak must receive ZED_FLATPAK_NO_ESCAPE=1 so it stays inside the sandbox where GPU env applies
+	zedArgv := []string{"/usr/bin/flatpak", "run", "--branch=stable", "--arch=x86_64", "--command=zed-wrapper", "dev.zed.Zed"}
+	gotZed := strings.Join(InjectFlatpakEnvArgs(zedArgv, routing, nil), "\n")
+	if !strings.Contains(gotZed, "--env=ZED_FLATPAK_NO_ESCAPE=1") {
+		t.Errorf("expected --env=ZED_FLATPAK_NO_ESCAPE=1 for dev.zed.Zed, got:\n%s", gotZed)
+	}
+
+	// Explicit extra_env override must win over default ZED_FLATPAK_NO_ESCAPE=1
+	gotOverride := strings.Join(InjectFlatpakEnvArgs(zedArgv, routing, map[string]string{"ZED_FLATPAK_NO_ESCAPE": "0"}), "\n")
+	if !strings.Contains(gotOverride, "--env=ZED_FLATPAK_NO_ESCAPE=0") {
+		t.Errorf("expected explicit override ZED_FLATPAK_NO_ESCAPE=0 to win, got:\n%s", gotOverride)
+	}
+
+	// Non-Zed Flatpak must NOT receive ZED_FLATPAK_NO_ESCAPE
+	zenArgv := []string{"/usr/bin/flatpak", "run", "--arch=x86_64", "app.zen_browser.zen"}
+	gotZen := strings.Join(InjectFlatpakEnvArgs(zenArgv, routing, nil), "\n")
+	if strings.Contains(gotZen, "ZED_FLATPAK_NO_ESCAPE") {
+		t.Errorf("unexpected ZED_FLATPAK_NO_ESCAPE for non-Zed flatpak:\n%s", gotZen)
+	}
+}
+
 func toMap(env []string) map[string]string {
 	m := make(map[string]string, len(env))
 	for _, e := range env {

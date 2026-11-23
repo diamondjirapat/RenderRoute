@@ -27,9 +27,10 @@ type App struct {
 	Binary         string `json:"binary"`                   // Primary executable basename
 	TryExec        string `json:"try_exec,omitempty"`       // TryExec basename if present
 	StartupWMClass string `json:"startup_wm_class,omitempty"`
-	FlatpakID      string `json:"flatpak_id,omitempty"`     // X-Flatpak app ID if present
+	FlatpakID      string `json:"flatpak_id,omitempty"`      // X-Flatpak app ID if present
 	FlatpakCommand string `json:"flatpak_command,omitempty"` // --command= value from flatpak run if present
-	Path           string `json:"path"`                     // Active .desktop file path
+	SteamAppID     string `json:"steam_app_id,omitempty"`    // Steam AppID if Exec launches steam://rungameid/<id>
+	Path           string `json:"path"`                      // Active .desktop file path
 	Categories     string `json:"categories,omitempty"`
 	Terminal       bool   `json:"terminal,omitempty"`
 	PatchedGPU     string `json:"patched_gpu,omitempty"`   // GPU selector if .desktop override is active
@@ -113,7 +114,7 @@ func DiscoverAppsFrom(dirs []string, cfg *config.Config, query string) []App {
 			seen[id] = true
 
 			if cfg != nil {
-				if r, matched := cfg.MatchRule(app.ID, app.Binary, app.FlatpakID, app.StartupWMClass, app.FlatpakCommand); matched {
+				if r, matched := cfg.MatchRule(app.RuleMatchCandidates()...); matched {
 					app.RuleGPU = r.GPU
 				}
 			}
@@ -233,7 +234,29 @@ func parseDesktopFile(id, path string) (App, bool) {
 	}
 	app.Binary = extractPrimaryBinary(app.Exec)
 	app.FlatpakCommand = extractFlatpakCommand(app.Exec)
+	app.SteamAppID = extractSteamAppID(app.Exec)
 	return app, true
+}
+
+// RuleMatchCandidates returns the rule lookup keys for this desktop application.
+// Steam game shortcuts (Exec=steam steam://rungameid/<id>) intentionally omit app.Binary ("steam")
+// so they do not inherit or collide with rules targeting the Steam client itself.
+func (a App) RuleMatchCandidates() []string {
+	if a.SteamAppID != "" {
+		return []string{a.ID, "steam_app_" + a.SteamAppID, a.StartupWMClass}
+	}
+	return []string{a.ID, a.Binary, a.FlatpakID, a.StartupWMClass, a.FlatpakCommand}
+}
+
+// DefaultRuleTarget returns the preferred persistent rule key for this application.
+func (a App) DefaultRuleTarget() string {
+	if a.SteamAppID != "" {
+		return a.ID
+	}
+	if a.Binary != "" {
+		return a.Binary
+	}
+	return a.ID
 }
 
 // FindApp finds an app by exact ID/FlatpakID, exact Name/Binary/StartupWMClass/TryExec/FlatpakCommand,
@@ -249,10 +272,11 @@ func FindApp(apps []App, query string) (*App, error) {
 	}
 	low := strings.ToLower(q)
 
-	// Tier 1: exact ID or X-Flatpak match
+	// Tier 1: exact ID, X-Flatpak, or steam_app_<id> match
 	for i := range apps {
 		if strings.EqualFold(apps[i].ID, q) ||
-			(apps[i].FlatpakID != "" && strings.EqualFold(apps[i].FlatpakID, q)) {
+			(apps[i].FlatpakID != "" && strings.EqualFold(apps[i].FlatpakID, q)) ||
+			(apps[i].SteamAppID != "" && strings.EqualFold("steam_app_"+apps[i].SteamAppID, q)) {
 			return &apps[i], nil
 		}
 	}
@@ -286,8 +310,9 @@ func appMatchesExactToken(app App, low string) bool {
 	if low == "" {
 		return false
 	}
+	binMatch := app.SteamAppID == "" && strings.ToLower(app.Binary) == low
 	if strings.ToLower(app.Name) == low ||
-		strings.ToLower(app.Binary) == low ||
+		binMatch ||
 		strings.ToLower(app.StartupWMClass) == low ||
 		strings.ToLower(app.TryExec) == low ||
 		strings.ToLower(app.FlatpakCommand) == low {
@@ -894,6 +919,29 @@ func buildLaunchArgv(execLine string) []string {
 		}
 	}
 	return out
+}
+
+func extractSteamAppID(execLine string) string {
+	for _, tok := range SplitDesktopExec(execLine) {
+		low := strings.ToLower(tok)
+		for _, prefix := range []string{"steam://rungameid/", "steam://run/"} {
+			if strings.HasPrefix(low, prefix) {
+				rest := tok[len(prefix):]
+				var digits strings.Builder
+				for i := 0; i < len(rest); i++ {
+					if rest[i] >= '0' && rest[i] <= '9' {
+						digits.WriteByte(rest[i])
+					} else {
+						break
+					}
+				}
+				if digits.Len() > 0 {
+					return digits.String()
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func extractFlatpakCommand(execLine string) string {

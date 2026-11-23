@@ -138,6 +138,65 @@ func IsFlatpakCommand(argv []string) bool {
 	return flatpakRunIndex(argv) >= 0
 }
 
+// FlatpakAppID extracts the target Flatpak application ID from a `flatpak run ...` command,
+// or returns "" if argv is not a flatpak run command or has no app ID token.
+func FlatpakAppID(argv []string) string {
+	runIdx := flatpakRunIndex(argv)
+	if runIdx < 0 {
+		return ""
+	}
+	return flatpakAppIDFromArgs(argv[runIdx+1:])
+}
+
+func flatpakAppIDFromArgs(args []string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			if i+1 < len(args) {
+				return stripFlatpakRef(args[i+1])
+			}
+			return ""
+		}
+		if strings.HasPrefix(a, "-") {
+			if !strings.Contains(a, "=") && flatpakFlagTakesValue(a) && i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		return stripFlatpakRef(a)
+	}
+	return ""
+}
+
+func stripFlatpakRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if idx := strings.Index(ref, "/"); idx > 0 {
+		ref = ref[:idx]
+	}
+	return ref
+}
+
+func flatpakFlagTakesValue(flag string) bool {
+	switch flag {
+	case "--arch", "--branch", "--command", "--commit", "--runtime", "--runtime-version",
+		"--runtime-commit", "--cwd", "--env", "--env-fd", "--unset-env",
+		"--filesystem", "--nofilesystem", "--socket", "--nosocket",
+		"--device", "--nodevice", "--share", "--unshare",
+		"--talk-name", "--no-talk-name", "--own-name",
+		"--system-talk-name", "--system-no-talk-name", "--system-own-name",
+		"--persist", "--add-policy", "--remove-policy", "--instance-id-fd",
+		"--app-path", "--usr-path", "--parent-pid", "--parent-expose-pids",
+		"-a":
+		return true
+	}
+	return false
+}
+
+func isZedFlatpakAppID(appID string) bool {
+	low := strings.ToLower(strings.TrimSpace(appID))
+	return low == "dev.zed.zed" || strings.HasPrefix(low, "dev.zed.zed-") || strings.HasPrefix(low, "dev.zed.zed.")
+}
+
 // flatpakRunIndex returns the index of the "run" subcommand token in a `flatpak ... run ...`
 // command (accounting for optional `env KEY=VAL ...` wrappers), or -1 if argv is not a flatpak run command.
 func flatpakRunIndex(argv []string) int {
@@ -249,11 +308,18 @@ func InjectFlatpakEnvArgs(argv []string, env RoutingEnv, extra map[string]string
 	}
 
 	arch := flatpakArchFromArgv(argv[runIdx+1:])
+	appID := flatpakAppIDFromArgs(argv[runIdx+1:])
 	sandboxEnv := env.ForFlatpakSandbox(arch)
 
-	mergedSet := make(map[string]string, len(sandboxEnv.Set)+len(extra))
+	mergedSet := make(map[string]string, len(sandboxEnv.Set)+len(extra)+1)
 	for k, v := range sandboxEnv.Set {
 		mergedSet[k] = v
+	}
+	// Zed's Flatpak escapes the sandbox via `flatpak-spawn --host`, which strips all
+	// sandbox-injected GPU routing variables. Setting ZED_FLATPAK_NO_ESCAPE=1 keeps Zed
+	// inside the sandbox so RenderRoute's GPU selection takes effect (unless overridden).
+	if isZedFlatpakAppID(appID) {
+		mergedSet["ZED_FLATPAK_NO_ESCAPE"] = "1"
 	}
 	for k, v := range extra {
 		mergedSet[k] = v

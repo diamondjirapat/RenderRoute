@@ -30,10 +30,12 @@ type GPUProcess struct {
 	GPUShort    string   `json:"gpu_short"`
 	GPURole     gpu.Role `json:"gpu_role"`
 	GPUIndex    int      `json:"gpu_index"`
-	VRAMUsedMB  *float64 `json:"vram_used_mb,omitempty"`
-	RuleGPU     string   `json:"rule_gpu,omitempty"`
-	RuleMatches *bool    `json:"rule_matches,omitempty"`
-	OwnedByUser bool     `json:"owned_by_user"`
+	VRAMUsedMB      *float64 `json:"vram_used_mb,omitempty"`
+	RuleGPU         string   `json:"rule_gpu,omitempty"`
+	RuleMatches     *bool    `json:"rule_matches,omitempty"`
+	RuleWarningCode string   `json:"rule_warning_code,omitempty"`
+	RuleWarning     string   `json:"rule_warning,omitempty"`
+	OwnedByUser     bool     `json:"owned_by_user"`
 }
 
 // ListGPUProcesses discovers active processes using each GPU via /proc/<pid>/fd,
@@ -106,6 +108,7 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 			matchedGPUs := map[string]gpu.GPU{}
 			vramByGPU := map[string]float64{}
 			hasDRMActivity := map[string]bool{}
+			hasDRMStats := map[string]bool{}
 			hasNvidiaCharDev := false
 
 			for _, fd := range fds {
@@ -137,11 +140,16 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 						}
 					}
 					if ok {
-						if mb, hasMem := parseDRMMemoryMB(fdInfo); hasMem && mb > vramByGPU[matched.ID] {
-							vramByGPU[matched.ID] = mb
+						if hasDRMFDInfoStats(fdInfo) {
+							hasDRMStats[matched.ID] = true
+						}
+						if mb, hasMem := parseDRMMemoryMB(fdInfo); hasMem && mb > 0 {
+							if mb > vramByGPU[matched.ID] {
+								vramByGPU[matched.ID] = mb
+							}
 							hasDRMActivity[matched.ID] = true
 						}
-						if hasActiveDRMEngine(fdInfo) {
+						if hasAnyDRMMemory(fdInfo) || hasActiveDRMEngine(fdInfo) {
 							hasDRMActivity[matched.ID] = true
 						}
 					}
@@ -168,6 +176,13 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 				// non-CLOEXEC /dev/dri/renderD* FD (inherited from a launcher/compositor/terminal)
 				// without any /dev/nvidia* FD or DRM activity is not actually using the NVIDIA GPU.
 				if g.Driver == "nvidia" && !hasNvidiaCharDev && !hasDRMActivity[gpuID] {
+					continue
+				}
+				// On DRM drivers that expose per-FD memory/engine statistics (e.g. i915, xe, amdgpu),
+				// a process holding an idle probe FD with 0 memory allocated and 0 ns engine time
+				// (such as Electron/Chromium browser processes probing render nodes) is not actively
+				// rendering on that GPU.
+				if g.Driver != "nvidia" && hasDRMStats[gpuID] && !hasDRMActivity[gpuID] {
 					continue
 				}
 				k := key{pid: pid, gpuID: gpuID}
@@ -241,7 +256,7 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 		}
 	}
 
-	// Annotate rule matches and build sorted result
+	// Annotate rule matches and diagnose bypass/mismatch causes
 	out := make([]GPUProcess, 0, len(found))
 	for _, p := range found {
 		if cfg != nil {
@@ -250,6 +265,10 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 				if resolved, err := gpu.Resolve(gpus, rule.GPU); err == nil {
 					matches := resolved.ID == p.GPUID
 					p.RuleMatches = &matches
+					if !matches {
+						pidDir := filepath.Join(procRoot, strconv.Itoa(p.PID))
+						p.RuleWarningCode, p.RuleWarning = diagnoseRuleMismatch(pidDir, *p, rule, *resolved)
+					}
 				}
 			}
 		}
@@ -453,6 +472,41 @@ func readProcMeta(pidDir string, myUID int) (name, exe, cmdline string, owned bo
 	return name, exe, cmdline, owned
 }
 
+func hasDRMFDInfoStats(info map[string]string) bool {
+	if info["drm-driver"] == "" {
+		return false
+	}
+	for k := range info {
+		if strings.HasPrefix(k, "drm-engine-") ||
+			strings.HasPrefix(k, "drm-total-") ||
+			strings.HasPrefix(k, "drm-resident-") ||
+			strings.HasPrefix(k, "drm-memory-") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyDRMMemory(info map[string]string) bool {
+	for k, v := range info {
+		if !strings.HasPrefix(k, "drm-total-") &&
+			!strings.HasPrefix(k, "drm-resident-") &&
+			!strings.HasPrefix(k, "drm-memory-") &&
+			!strings.HasPrefix(k, "drm-shared-") &&
+			!strings.HasPrefix(k, "drm-active-") {
+			continue
+		}
+		fields := strings.Fields(v)
+		if len(fields) == 0 {
+			continue
+		}
+		if val, err := strconv.ParseFloat(fields[0], 64); err == nil && val > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func hasActiveDRMEngine(info map[string]string) bool {
 	for k, v := range info {
 		if !strings.HasPrefix(k, "drm-engine-") {
@@ -469,8 +523,8 @@ func hasActiveDRMEngine(info map[string]string) bool {
 	return false
 }
 
-// detectProcessDesktopID attempts to identify the desktop/Flatpak application ID owning a process
-// using /proc/<pid> metadata (FLATPAK_ID, .flatpak-info, cgroup, exe/cmdline paths).
+// detectProcessDesktopID attempts to identify the desktop/Flatpak/Steam application ID owning a process
+// using /proc/<pid> metadata (FLATPAK_ID, .flatpak-info, systemd cgroup scopes, exe/cmdline paths).
 func detectProcessDesktopID(pidDir, exe, cmdline string) string {
 	// 1. Check /proc/<pid>/environ for FLATPAK_ID or FLATPAK_XDG_*_HOME=/.var/app/<id>/
 	if rawEnv, err := os.ReadFile(filepath.Join(pidDir, "environ")); err == nil && len(rawEnv) > 0 {
@@ -510,9 +564,9 @@ func detectProcessDesktopID(pidDir, exe, cmdline string) string {
 		}
 	}
 
-	// 3. Check /proc/<pid>/cgroup for Flatpak scope (app-flatpak-<id>-<rand>.scope)
+	// 3. Check /proc/<pid>/cgroup for Flatpak, Steam, DMS/desktop launcher, or autostart units
 	if b, err := os.ReadFile(filepath.Join(pidDir, "cgroup")); err == nil && len(b) > 0 {
-		if id := extractFlatpakIDFromCgroup(string(b)); id != "" {
+		if id := extractDesktopIDFromCgroup(string(b)); id != "" {
 			return id
 		}
 	}
@@ -527,21 +581,68 @@ func detectProcessDesktopID(pidDir, exe, cmdline string) string {
 	return ""
 }
 
-func extractFlatpakIDFromCgroup(cgroupContent string) string {
+func extractDesktopIDFromCgroup(cgroupContent string) string {
 	for _, line := range strings.Split(cgroupContent, "\n") {
-		idx := strings.Index(line, "app-flatpak-")
-		if idx < 0 {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		rest := line[idx+len("app-flatpak-"):]
-		rest = strings.TrimSuffix(strings.TrimSpace(rest), ".scope")
-		// Strip trailing -<instanceID> (digits or hex/random suffix)
-		if dash := strings.LastIndex(rest, "-"); dash > 0 {
-			rest = rest[:dash]
+		// cgroup v2 line format: "0::/user.slice/.../<unit>"
+		if idx := strings.LastIndex(line, "/"); idx >= 0 {
+			line = line[idx+1:]
 		}
-		rest = unescapeSystemdUnit(rest)
-		if strings.Contains(rest, ".") {
-			return rest
+		unit := strings.TrimSpace(line)
+
+		// Flatpak scope: app-flatpak-<escaped-app-id>-<instance>.scope
+		if strings.HasPrefix(unit, "app-flatpak-") && strings.HasSuffix(unit, ".scope") {
+			rest := strings.TrimSuffix(strings.TrimPrefix(unit, "app-flatpak-"), ".scope")
+			if dash := strings.LastIndex(rest, "-"); dash > 0 {
+				rest = rest[:dash]
+			}
+			rest = strings.TrimSuffix(unescapeSystemdUnit(rest), ".desktop")
+			if strings.Contains(rest, ".") {
+				return rest
+			}
+		}
+
+		// Steam game scope: app-steam-app<appid>-<pid>.scope
+		if strings.HasPrefix(unit, "app-steam-app") && strings.HasSuffix(unit, ".scope") {
+			rest := strings.TrimSuffix(strings.TrimPrefix(unit, "app-steam-app"), ".scope")
+			var digits strings.Builder
+			for i := 0; i < len(rest); i++ {
+				if rest[i] >= '0' && rest[i] <= '9' {
+					digits.WriteByte(rest[i])
+				} else {
+					break
+				}
+			}
+			if digits.Len() > 0 {
+				return "steam_app_" + digits.String()
+			}
+		}
+
+		// Standard freedesktop/systemd desktop launcher scopes:
+		// app-<launcher>-<escaped-desktop-id>-<random>.scope
+		for _, prefix := range []string{"app-dms-", "app-gnome-", "app-kde-", "app-uwsm-", "app-xdg-"} {
+			if strings.HasPrefix(unit, prefix) && strings.HasSuffix(unit, ".scope") {
+				rest := strings.TrimSuffix(strings.TrimPrefix(unit, prefix), ".scope")
+				if dash := strings.LastIndex(rest, "-"); dash > 0 {
+					rest = rest[:dash]
+				}
+				rest = strings.TrimSpace(strings.TrimSuffix(unescapeSystemdUnit(rest), ".desktop"))
+				if rest != "" {
+					return rest
+				}
+			}
+		}
+
+		// XDG autostart systemd user service: app-<escaped-desktop-id>@autostart.service
+		if strings.HasPrefix(unit, "app-") && strings.HasSuffix(unit, "@autostart.service") {
+			rest := strings.TrimSuffix(strings.TrimPrefix(unit, "app-"), "@autostart.service")
+			rest = strings.TrimSpace(strings.TrimSuffix(unescapeSystemdUnit(rest), ".desktop"))
+			if rest != "" {
+				return rest
+			}
 		}
 	}
 	return ""
@@ -587,6 +688,75 @@ func shouldSkipNoiseProcess(name string) bool {
 		return true
 	}
 	return false
+}
+
+// diagnoseRuleMismatch inspects /proc/<pid>/cgroup and /proc/<pid>/environ to explain
+// why a running process is not using its pinned GPU rule.
+func diagnoseRuleMismatch(pidDir string, p GPUProcess, rule config.Rule, targetGPU gpu.GPU) (code, warning string) {
+	cgroupRaw, _ := os.ReadFile(filepath.Join(pidDir, "cgroup"))
+	cgroup := string(cgroupRaw)
+	envMap, envReadable := readProcEnvironMap(pidDir)
+
+	// 1. Flatpak app escaped the sandbox via flatpak-spawn --host (stripping sandbox GPU env vars)
+	if strings.Contains(cgroup, "flatpak-session-helper.service") ||
+		(envReadable && envMap["FLATPAK_ID"] == "" && envMap["RENDERROUTE_GPU"] == "" &&
+			(envMap["FLATPAK_XDG_DATA_HOME"] != "" || envMap["FLATPAK_XDG_CONFIG_HOME"] != "")) {
+		return "flatpak_host_escape", "Escaped Flatpak sandbox via flatpak-spawn --host (GPU env stripped). Restart app so RenderRoute's sandbox override applies."
+	}
+
+	// 2. Steam game running inside a Steam app scope inherited Steam's GPU environment
+	if strings.HasPrefix(p.DesktopID, "steam_app_") || strings.Contains(cgroup, "app-steam-app") {
+		return "steam_child_inherited", fmt.Sprintf("Steam game inherited Steam's GPU (%s). Set Steam Launch Options: renderroute run %s -- %%command%%", p.GPUShort, rule.GPU)
+	}
+
+	if envReadable {
+		rrGPU := envMap["RENDERROUTE_GPU"]
+		rrRole := envMap["RENDERROUTE_GPU_ROLE"]
+
+		// 3. Process inherited RenderRoute env for a DIFFERENT GPU from a parent process
+		if rrGPU != "" && !strings.EqualFold(rrGPU, targetGPU.ID) {
+			inherited := rrRole
+			if inherited == "" {
+				inherited = rrGPU
+			}
+			return "parent_env_inherited", fmt.Sprintf("Inherited RenderRoute GPU env (%s) from a parent process; launch standalone or wrap with 'renderroute run %s --'", inherited, rule.GPU)
+		}
+
+		// 4. Process WAS launched with RenderRoute for the target GPU, yet still opened the wrong GPU
+		if rrGPU != "" && strings.EqualFold(rrGPU, targetGPU.ID) {
+			return "env_ignored", fmt.Sprintf("RenderRoute env was set for %s, but app still uses %s (it may ignore GPU env vars or follow compositor primary GPU)", rule.GPU, p.GPUShort)
+		}
+
+		// 5. Process has no RenderRoute env at all
+		if rrGPU == "" {
+			if !rule.DesktopPatched {
+				return "no_desktop_override", "No .desktop launcher is patched for this rule — pin the app in Apps & Run or launch via 'renderroute run --auto --'"
+			}
+			return "launched_without_renderroute", "Launched outside RenderRoute (keybind, terminal, or pre-existing single-instance process) — relaunch to apply rule"
+		}
+	}
+
+	if !rule.DesktopPatched {
+		return "no_desktop_override", "No .desktop launcher is patched for this rule — pin the app in Apps & Run or launch via 'renderroute run --auto --'"
+	}
+	return "rule_mismatch", fmt.Sprintf("Running on %s instead of pinned %s — restart app to apply rule", p.GPUShort, rule.GPU)
+}
+
+func readProcEnvironMap(pidDir string) (map[string]string, bool) {
+	raw, err := os.ReadFile(filepath.Join(pidDir, "environ"))
+	if err != nil {
+		return nil, false
+	}
+	res := make(map[string]string)
+	for _, entry := range bytes.Split(raw, []byte{0}) {
+		if len(entry) == 0 {
+			continue
+		}
+		if k, v, ok := strings.Cut(string(entry), "="); ok {
+			res[k] = v
+		}
+	}
+	return res, true
 }
 
 // RelaunchResult describes the result of restarting a running process on a target GPU.

@@ -39,9 +39,12 @@ Item {
     property int totalProcesses: 0
     property var gpus: []
     property var warnings: []
+    property var routingWarnings: []
     property var processes: []
     property var rules: []
     property var apps: []
+    property var _seenRoutingWarnings: ({})
+    property bool _initialRefreshDone: false
 
     function loadSettings() {
         const load = (key, fallback) => {
@@ -118,6 +121,28 @@ Item {
         PluginService.setGlobalVar(pluginId, "defaultGpuShort", defaultGpuShort);
         PluginService.setGlobalVar(pluginId, "gpus", gpus);
         PluginService.setGlobalVar(pluginId, "warnings", warnings);
+        PluginService.setGlobalVar(pluginId, "routingWarnings", routingWarnings);
+    }
+
+    function notifyNewRoutingWarnings(list) {
+        const activeKeys = {};
+        for (let i = 0; i < list.length; i++) {
+            const w = list[i];
+            if (!w || !w.message)
+                continue;
+            const key = `${w.pid}:${w.code || w.message}`;
+            activeKeys[key] = true;
+            if (root._initialRefreshDone && !root._seenRoutingWarnings[key]) {
+                const label = w.process || (`PID ${w.pid}`);
+                const ruleLabel = (w.rule_gpu || "").toUpperCase();
+                ToastService.showWarning(
+                    `${label} bypassed ${ruleLabel} GPU rule`,
+                    w.message
+                );
+            }
+        }
+        root._seenRoutingWarnings = activeKeys;
+        root._initialRefreshDone = true;
     }
 
     function refresh() {
@@ -144,8 +169,10 @@ Item {
                 root.totalProcesses = Number(data.total_processes || 0);
                 root.gpus = Array.isArray(data.gpus) ? data.gpus : [];
                 root.warnings = Array.isArray(data.warnings) ? data.warnings : [];
+                root.routingWarnings = Array.isArray(data.routing_warnings) ? data.routing_warnings : [];
                 root.processes = Array.isArray(data.processes) ? data.processes : [];
                 root.rules = Array.isArray(data.rules) ? data.rules : [];
+                root.notifyNewRoutingWarnings(root.routingWarnings);
                 root.syncGlobals();
             } catch (e) {
                 root.available = false;
@@ -214,10 +241,27 @@ Item {
         }
         if (applyDesktop) {
             args.push("--apply-desktop");
+        } else {
+            args.push("--no-apply-desktop");
         }
         Proc.runCommand(`${pluginId}.setRule`, args, (stdout, exitCode) => {
             if (exitCode === 0) {
-                ToastService.showInfo(`Pinned ${displayName || target} -> ${gpuSelector.toUpperCase()}`);
+                const out = stdout || "";
+                const label = displayName || target;
+                const gpuLabel = gpuSelector.toUpperCase();
+                if (out.indexOf("[steam game:") !== -1) {
+                    ToastService.showWarning(
+                        `Pinned ${label} -> ${gpuLabel}`,
+                        `If Steam runs on another GPU, set Steam Launch Options to: renderroute run ${gpuSelector} -- %command%`
+                    );
+                } else if (out.indexOf("[no .desktop found") !== -1) {
+                    ToastService.showWarning(
+                        `Saved rule ${label} -> ${gpuLabel} (no .desktop found)`,
+                        "No matching launcher entry was patched. Use 'renderroute run --auto' or pin the app in Apps & Run."
+                    );
+                } else {
+                    ToastService.showInfo(`Pinned ${label} -> ${gpuLabel}`);
+                }
                 root.refresh();
                 if (root.appsLoaded)
                     root.fetchApps("");

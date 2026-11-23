@@ -145,3 +145,153 @@ func TestListGPUProcessesIgnoresLeakedNvidiaRenderFDAndDetectsDesktopID(t *testi
 		t.Errorf("expected rule matched via DesktopID with mismatch, got rule=%q matches=%v", p.RuleGPU, p.RuleMatches)
 	}
 }
+
+func TestExtractDesktopIDFromCgroupAndIdleMesaFDFiltering(t *testing.T) {
+	cgroupCases := map[string]string{
+		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-dev.vencord.Vesktop-3849228871.scope\n": "dev.vencord.Vesktop",
+		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-dms-org.kde.dolphin-mwsv38f4dcs5.scope\n":       "org.kde.dolphin",
+		`0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-dms-Detroit\x20Become\x20Human-abc123.scope`:    "Detroit Become Human",
+		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam-app1422450-50625.scope\n":                 "steam_app_1422450",
+		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-com.github.wwmm.easyeffects@autostart.service":  "com.github.wwmm.easyeffects",
+	}
+	for raw, want := range cgroupCases {
+		if got := extractDesktopIDFromCgroup(raw); got != want {
+			t.Errorf("extractDesktopIDFromCgroup(%q) = %q, want %q", raw, got, want)
+		}
+	}
+
+	procRoot := t.TempDir()
+
+	// PID 2001: Electron browser process holding an idle i915 probe FD (0 memory, 0 ns engines) -> should be ignored
+	idleDir := filepath.Join(procRoot, "2001")
+	_ = os.MkdirAll(filepath.Join(idleDir, "fd"), 0o755)
+	_ = os.MkdirAll(filepath.Join(idleDir, "fdinfo"), 0o755)
+	_ = os.WriteFile(filepath.Join(idleDir, "comm"), []byte("vesktop.bin\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(idleDir, "cmdline"), []byte("/app/bin/vesktop/vesktop.bin\x00"), 0o644)
+	_ = os.Symlink("/dev/dri/renderD128", filepath.Join(idleDir, "fd", "50"))
+	_ = os.WriteFile(filepath.Join(idleDir, "fdinfo", "50"), []byte("drm-driver:\ti915\ndrm-pdev:\t0000:00:02.0\ndrm-total-system0:\t0\ndrm-engine-render:\t0 ns\n"), 0o644)
+
+	// PID 2002: easyeffects actively using i915 (drm-total-system0: 2316 KiB) in a DMS/autostart cgroup -> must be kept
+	activeDir := filepath.Join(procRoot, "2002")
+	_ = os.MkdirAll(filepath.Join(activeDir, "fd"), 0o755)
+	_ = os.MkdirAll(filepath.Join(activeDir, "fdinfo"), 0o755)
+	_ = os.WriteFile(filepath.Join(activeDir, "comm"), []byte("easyeffects\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(activeDir, "cmdline"), []byte("easyeffects\x00"), 0o644)
+	_ = os.WriteFile(filepath.Join(activeDir, "cgroup"), []byte("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-dms-com.github.wwmm.easyeffects-abc123.scope\n"), 0o644)
+	_ = os.Symlink("/dev/dri/renderD128", filepath.Join(activeDir, "fd", "143"))
+	_ = os.WriteFile(filepath.Join(activeDir, "fdinfo", "143"), []byte("drm-driver:\ti915\ndrm-pdev:\t0000:00:02.0\ndrm-total-system0:\t2316 KiB\ndrm-engine-render:\t0 ns\n"), 0o644)
+
+	gpus := []gpu.GPU{
+		{
+			Index:      0,
+			ID:         "0000:00:02.0",
+			Card:       "card1",
+			CardPath:   "/dev/dri/card1",
+			RenderNode: "renderD128",
+			RenderPath: "/dev/dri/renderD128",
+			PCISlot:    "0000:00:02.0",
+			Vendor:     "intel",
+			Driver:     "i915",
+			Name:       "Intel UHD",
+			ShortName:  "UHD",
+			Role:       gpu.RoleIntegrated,
+		},
+	}
+
+	procs := listGPUProcessesFrom(procRoot, gpus, config.Default(), false)
+	if len(procs) != 1 {
+		t.Fatalf("expected only active easyeffects (not idle i915 probe vesktop.bin), got %+v", procs)
+	}
+	if procs[0].PID != 2002 || procs[0].DesktopID != "com.github.wwmm.easyeffects" {
+		t.Errorf("unexpected process result: %+v", procs[0])
+	}
+}
+
+func TestDiagnoseRuleMismatchCoversBypassBehaviors(t *testing.T) {
+	igpu := gpu.GPU{ID: "0000:00:02.0", Role: gpu.RoleIntegrated, ShortName: "UHD"}
+	dgpu := gpu.GPU{ID: "0000:01:00.0", Role: gpu.RoleDiscrete, ShortName: "RTX 4050"}
+
+	tests := []struct {
+		name     string
+		cgroup   string
+		environ  string
+		proc     GPUProcess
+		rule     config.Rule
+		target   gpu.GPU
+		wantCode string
+	}{
+		{
+			name:     "flatpak host escape",
+			cgroup:   "0::/user.slice/user-1000.slice/user@1000.service/app.slice/flatpak-session-helper.service\n",
+			environ:  "FLATPAK_XDG_DATA_HOME=/home/user/.var/app/dev.zed.Zed/data\x00",
+			proc:     GPUProcess{PID: 10, Name: "zed-editor", GPUShort: "RTX 4050"},
+			rule:     config.Rule{Target: "zed-editor", GPU: "igpu", DesktopPatched: true},
+			target:   igpu,
+			wantCode: "flatpak_host_escape",
+		},
+		{
+			name:     "steam game inherited steam gpu",
+			cgroup:   "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam-app1422450-50625.scope\n",
+			environ:  "RENDERROUTE_GPU=0000:00:02.0\x00RENDERROUTE_GPU_ROLE=igpu\x00",
+			proc:     GPUProcess{PID: 20, Name: "MainThrd", DesktopID: "steam_app_1422450", GPUShort: "UHD"},
+			rule:     config.Rule{Target: "mainthrd", GPU: "dgpu", DesktopPatched: false},
+			target:   dgpu,
+			wantCode: "steam_child_inherited",
+		},
+		{
+			name:     "parent renderroute env inherited",
+			cgroup:   "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-dms-parent-123.scope\n",
+			environ:  "RENDERROUTE_GPU=0000:00:02.0\x00RENDERROUTE_GPU_ROLE=igpu\x00",
+			proc:     GPUProcess{PID: 30, Name: "childapp", GPUShort: "UHD"},
+			rule:     config.Rule{Target: "childapp", GPU: "dgpu", DesktopPatched: true},
+			target:   dgpu,
+			wantCode: "parent_env_inherited",
+		},
+		{
+			name:     "app ignored renderroute env",
+			cgroup:   "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-dms-foo-123.scope\n",
+			environ:  "RENDERROUTE_GPU=0000:00:02.0\x00RENDERROUTE_GPU_ROLE=igpu\x00",
+			proc:     GPUProcess{PID: 40, Name: "foo", GPUShort: "RTX 4050"},
+			rule:     config.Rule{Target: "foo", GPU: "igpu", DesktopPatched: true},
+			target:   igpu,
+			wantCode: "env_ignored",
+		},
+		{
+			name:     "no desktop override patched",
+			cgroup:   "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-niri-foo-123.scope\n",
+			environ:  "PATH=/usr/bin\x00",
+			proc:     GPUProcess{PID: 50, Name: "foo", GPUShort: "RTX 4050"},
+			rule:     config.Rule{Target: "foo", GPU: "igpu", DesktopPatched: false},
+			target:   igpu,
+			wantCode: "no_desktop_override",
+		},
+		{
+			name:     "launched outside renderroute",
+			cgroup:   "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-niri-ghostty-123.scope\n",
+			environ:  "PATH=/usr/bin\x00",
+			proc:     GPUProcess{PID: 60, Name: "ghostty", GPUShort: "RTX 4050"},
+			rule:     config.Rule{Target: "ghostty", GPU: "igpu", DesktopPatched: true},
+			target:   igpu,
+			wantCode: "launched_without_renderroute",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pidDir := t.TempDir()
+			if tc.cgroup != "" {
+				_ = os.WriteFile(filepath.Join(pidDir, "cgroup"), []byte(tc.cgroup), 0o644)
+			}
+			if tc.environ != "" {
+				_ = os.WriteFile(filepath.Join(pidDir, "environ"), []byte(tc.environ), 0o644)
+			}
+			code, msg := diagnoseRuleMismatch(pidDir, tc.proc, tc.rule, tc.target)
+			if code != tc.wantCode {
+				t.Errorf("code = %q, want %q (msg=%q)", code, tc.wantCode, msg)
+			}
+			if msg == "" {
+				t.Errorf("expected non-empty warning message for %q", tc.name)
+			}
+		})
+	}
+}

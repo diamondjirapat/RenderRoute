@@ -21,6 +21,16 @@ import (
 
 const version = "1.0.0_dev"
 
+// RoutingWarning describes a detected runtime GPU rule bypass or mismatch on a running process.
+type RoutingWarning struct {
+	Code    string `json:"code"`
+	PID     int    `json:"pid"`
+	Process string `json:"process"`
+	GPU     string `json:"gpu"`
+	RuleGPU string `json:"rule_gpu"`
+	Message string `json:"message"`
+}
+
 // StatusPayload is the unified JSON payload consumed by the DankMaterialShell widget plugin.
 type StatusPayload struct {
 	Version          string            `json:"version"`
@@ -32,6 +42,7 @@ type StatusPayload struct {
 	TotalProcesses   int               `json:"total_processes"`
 	GPUs             []gpu.GPU         `json:"gpus"`
 	Warnings         []gpu.GPUWarning  `json:"warnings,omitempty"`
+	RoutingWarnings  []RoutingWarning  `json:"routing_warnings,omitempty"`
 	Processes        []proc.GPUProcess `json:"processes"`
 	Rules            []config.Rule     `json:"rules"`
 }
@@ -111,7 +122,7 @@ Usage:
   renderroute rule set <target> <gpu> [--desktop-id <id>] [--name <label>] [--apply-desktop|--no-apply-desktop]
   renderroute rule remove <target> [--desktop-id <id>] [--reset-desktop|--no-reset-desktop]
   renderroute rule sync
-      Manage persistent per-process / per-app GPU rules and sync .desktop/autostart overrides.
+      Manage persistent per-process / per-app GPU rules (patches .desktop/autostart by default; pass --no-apply-desktop to skip).
 
   renderroute apps [--search <query>] [--json]
       List installed .desktop applications and their RenderRoute GPU assignments.
@@ -230,7 +241,16 @@ func cmdPS(args []string) error {
 		}
 		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", p.PID, p.Name, p.GPUShort, p.GPURole, vram, ruleStr)
 	}
-	return w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if rw := collectRoutingWarnings(procs); len(rw) > 0 {
+		fmt.Fprintln(os.Stderr)
+		for _, warn := range rw {
+			fmt.Fprintf(os.Stderr, "WARNING: %s (PID %d, on %s, rule %s): %s\n", warn.Process, warn.PID, warn.GPU, warn.RuleGPU, warn.Message)
+		}
+	}
+	return nil
 }
 
 func cmdStatus(args []string) error {
@@ -270,6 +290,7 @@ func cmdStatus(args []string) error {
 	}
 
 	warnings := gpu.DetectUnboundPCIGPUs(gpus)
+	routingWarnings := collectRoutingWarnings(procs)
 
 	defSel := cfg.DefaultGPU
 	defID := ""
@@ -289,6 +310,7 @@ func cmdStatus(args []string) error {
 		TotalProcesses:   len(procs),
 		GPUs:             gpus,
 		Warnings:         warnings,
+		RoutingWarnings:  routingWarnings,
 		Processes:        procs,
 		Rules:            cfg.SortedRules(),
 	}
@@ -308,6 +330,9 @@ func cmdStatus(args []string) error {
 		len(payload.GPUs), payload.TotalProcesses, payload.DGPUProcessCount, payload.DGPUActive, len(payload.Rules))
 	for _, warn := range payload.Warnings {
 		fmt.Fprintf(os.Stderr, "WARNING: %s (%s, %s): %s\n", warn.Name, warn.Role, warn.PCISlot, warn.Reason)
+	}
+	for _, warn := range payload.RoutingWarnings {
+		fmt.Fprintf(os.Stderr, "WARNING: %s (PID %d, on %s, rule %s): %s\n", warn.Process, warn.PID, warn.GPU, warn.RuleGPU, warn.Message)
 	}
 	return nil
 }
@@ -406,16 +431,21 @@ func cmdRun(args []string) error {
 	}
 	cfg, _ := config.Load()
 
+	matchCandidates := []string{cmdArgs[0], filepath.Base(cmdArgs[0])}
+	if fpID := gpu.FlatpakAppID(cmdArgs); fpID != "" {
+		matchCandidates = append([]string{fpID}, matchCandidates...)
+	}
+
 	var extraEnv map[string]string
 	if autoMode || strings.EqualFold(selector, "auto") {
-		if r, ok := cfg.MatchRule(cmdArgs[0], filepath.Base(cmdArgs[0])); ok {
+		if r, ok := cfg.MatchRule(matchCandidates...); ok {
 			selector = r.GPU
 			extraEnv = r.ExtraEnv
 		} else {
 			selector = "default"
 		}
 	} else {
-		if r, ok := cfg.MatchRule(cmdArgs[0], filepath.Base(cmdArgs[0])); ok {
+		if r, ok := cfg.MatchRule(matchCandidates...); ok {
 			extraEnv = r.ExtraEnv
 		}
 	}
@@ -559,7 +589,7 @@ func cmdRule(args []string) error {
 		var pos []string
 		desktopID := ""
 		displayName := ""
-		applyDesktop := false
+		applyDesktop := true
 		noApplyDesktop := false
 		for i := 1; i < len(args); i++ {
 			switch args[i] {
@@ -584,7 +614,7 @@ func cmdRule(args []string) error {
 			}
 		}
 		if len(pos) < 2 {
-			return errors.New("usage: renderroute rule set <target> <gpu> [--desktop-id <id>] [--apply-desktop]")
+			return errors.New("usage: renderroute rule set <target> <gpu> [--desktop-id <id>] [--no-apply-desktop]")
 		}
 		targetName := pos[0]
 		gpuSel := pos[1]
@@ -608,9 +638,21 @@ func cmdRule(args []string) error {
 			return err
 		}
 
+		if desktopID == "" {
+			if ex, ok := cfg.MatchRule(targetName); ok && ex.DesktopID != "" {
+				desktopID = ex.DesktopID
+			}
+		}
+
+		apps := desktop.DiscoverApps(cfg, "")
+		var steamAppID string
+		targetName, desktopID, displayName, steamAppID = resolveRuleApp(apps, targetName, desktopID, displayName)
+
 		existing, hasExisting := cfg.MatchRule(targetName, desktopID)
-		if desktopID == "" && hasExisting && existing.DesktopID != "" {
-			desktopID = existing.DesktopID
+		if hasExisting && desktopID != "" && existing.DesktopID != "" &&
+			!strings.EqualFold(config.NormalizeKey(existing.DesktopID), config.NormalizeKey(desktopID)) {
+			hasExisting = false
+			existing = config.Rule{}
 		}
 		if displayName == "" && hasExisting && existing.DisplayName != "" {
 			displayName = existing.DisplayName
@@ -622,18 +664,9 @@ func cmdRule(args []string) error {
 
 		patched := hasExisting && existing.DesktopPatched
 		var patchedAutostart []string
-		shouldPatch := !noApplyDesktop && (applyDesktop || (hasExisting && existing.DesktopPatched))
+		shouldPatch := !noApplyDesktop && applyDesktop
 		if shouldPatch {
 			patched = false
-			if desktopID == "" {
-				apps := desktop.DiscoverApps(cfg, "")
-				if found, err := desktop.FindApp(apps, targetName); err == nil {
-					desktopID = found.ID
-					if displayName == "" || strings.EqualFold(displayName, targetName) {
-						displayName = found.Name
-					}
-				}
-			}
 			binPath := selfBinaryForDesktop()
 			if desktopID != "" {
 				if _, err := desktop.ApplyDesktopOverride(desktopID, storedSel, binPath, resolved.Role); err == nil {
@@ -666,6 +699,12 @@ func cmdRule(args []string) error {
 		}
 		if len(patchedAutostart) > 0 {
 			fmt.Printf(" [autostart patched: %d]", len(patchedAutostart))
+		}
+		if shouldPatch && !patched && len(patchedAutostart) == 0 {
+			fmt.Print(" [no .desktop found; only 'renderroute run --auto' applies]")
+		}
+		if steamAppID != "" {
+			fmt.Printf(" [steam game: set Steam Launch Options to \"renderroute run %s -- %%command%%\"]", storedSel)
 		}
 		fmt.Println()
 		return nil
@@ -901,11 +940,14 @@ func cmdLaunch(args []string) error {
 	}
 
 	var extraEnv map[string]string
-	if r, ok := cfg.MatchRule(app.ID, app.Binary); ok {
+	if r, ok := cfg.MatchRule(app.RuleMatchCandidates()...); ok {
 		if gpuSel == "" {
 			gpuSel = r.GPU
 		}
 		extraEnv = r.ExtraEnv
+	}
+	if gpuSel == "" && app.PatchedGPU != "" {
+		gpuSel = app.PatchedGPU
 	}
 	if gpuSel == "" {
 		gpuSel = "default"
@@ -1106,6 +1148,62 @@ func cmdDMS(args []string) error {
 	default:
 		return fmt.Errorf("unknown dms subcommand %q (expected install, uninstall, reload, status)", args[0])
 	}
+}
+
+func collectRoutingWarnings(procs []proc.GPUProcess) []RoutingWarning {
+	var out []RoutingWarning
+	seen := map[string]bool{}
+	for _, p := range procs {
+		if p.RuleWarning == "" {
+			continue
+		}
+		k := fmt.Sprintf("%d:%s", p.PID, p.RuleWarningCode)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, RoutingWarning{
+			Code:    p.RuleWarningCode,
+			PID:     p.PID,
+			Process: p.Name,
+			GPU:     p.GPUShort,
+			RuleGPU: p.RuleGPU,
+			Message: p.RuleWarning,
+		})
+	}
+	return out
+}
+
+func resolveRuleApp(apps []desktop.App, targetName, desktopID, displayName string) (resolvedTarget, resolvedDesktopID, resolvedDisplayName, steamAppID string) {
+	resolvedTarget = targetName
+	resolvedDesktopID = desktopID
+	resolvedDisplayName = displayName
+
+	if resolvedDesktopID != "" {
+		if found, err := desktop.FindApp(apps, resolvedDesktopID); err == nil {
+			resolvedDesktopID = found.ID
+			steamAppID = found.SteamAppID
+			if found.SteamAppID != "" && strings.EqualFold(config.NormalizeKey(resolvedTarget), "steam") {
+				resolvedTarget = found.ID
+			}
+			if resolvedDisplayName == "" || strings.EqualFold(resolvedDisplayName, targetName) {
+				resolvedDisplayName = found.Name
+			}
+		}
+		return
+	}
+
+	if found, err := desktop.FindApp(apps, resolvedTarget); err == nil {
+		resolvedDesktopID = found.ID
+		steamAppID = found.SteamAppID
+		if found.SteamAppID != "" && strings.EqualFold(config.NormalizeKey(resolvedTarget), "steam") {
+			resolvedTarget = found.ID
+		}
+		if resolvedDisplayName == "" || strings.EqualFold(resolvedDisplayName, targetName) {
+			resolvedDisplayName = found.Name
+		}
+	}
+	return
 }
 
 func resolveWithConfig(gpus []gpu.GPU, cfg *config.Config, selector string) (*gpu.GPU, error) {

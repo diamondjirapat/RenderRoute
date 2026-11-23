@@ -44,6 +44,8 @@ PluginComponent {
     readonly property color barIconColor: {
         if (!RenderRouteService.available)
             return Theme.error;
+        if ((RenderRouteService.routingWarnings || []).length > 0 || (RenderRouteService.warnings || []).length > 0)
+            return Theme.warning;
         if (RenderRouteService.dgpuActive)
             return Theme.primary;
         return Theme.widgetIconColor || Theme.surfaceText;
@@ -501,6 +503,62 @@ PluginComponent {
                     }
                 }
 
+                // GPU rule bypass / mismatch warning banner
+                StyledRect {
+                    id: routingWarningBanner
+                    visible: RenderRouteService.available && (RenderRouteService.routingWarnings || []).length > 0
+                    width: parent.width
+                    height: routingWarningCol.implicitHeight + Theme.spacingS * 2
+                    radius: Theme.cornerRadius
+                    color: Theme.withAlpha(Theme.warning, 0.14)
+                    border.width: 1
+                    border.color: Theme.withAlpha(Theme.warning, 0.45)
+
+                    Column {
+                        id: routingWarningCol
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: Theme.spacingS
+                        spacing: 4
+
+                        Repeater {
+                            model: (RenderRouteService.routingWarnings || []).slice(0, 3)
+
+                            Column {
+                                required property var modelData
+                                width: routingWarningCol.width
+                                spacing: 1
+
+                                StyledText {
+                                    width: parent.width
+                                    text: `Rule bypassed: ${modelData.process || ("PID " + modelData.pid)} on ${modelData.gpu} (pinned ${(modelData.rule_gpu || "").toUpperCase()})`
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    font.weight: Font.Bold
+                                    color: Theme.warning
+                                    elide: Text.ElideRight
+                                }
+
+                                StyledText {
+                                    width: parent.width
+                                    wrapMode: Text.WordWrap
+                                    text: modelData.message || ""
+                                    font.pixelSize: Theme.fontSizeSmall - 2
+                                    color: Theme.surfaceText
+                                }
+                            }
+                        }
+
+                        StyledText {
+                            visible: (RenderRouteService.routingWarnings || []).length > 3
+                            width: parent.width
+                            text: `+ ${RenderRouteService.routingWarnings.length - 3} more GPU rule warning(s) — see Processes tab`
+                            font.pixelSize: Theme.fontSizeSmall - 2
+                            color: Theme.surfaceVariantText
+                        }
+                    }
+                }
+
                 // 2. GPU Cards Strip (click a card to set Default GPU)
                 Row {
                     id: gpuCardsRow
@@ -646,7 +704,7 @@ PluginComponent {
                 // 4. Tab Content Area
                 Item {
                     width: parent.width
-                    height: Math.max(180, popoutScope.height - Theme.spacingM * 2 - 36 - (gpuWarningBanner.visible ? gpuWarningBanner.height + Theme.spacingS : 0) - (gpuCardsRow.visible ? gpuCardsRow.height + Theme.spacingS : 0) - 30 - Theme.spacingS * 3)
+                    height: Math.max(180, popoutScope.height - Theme.spacingM * 2 - 36 - (gpuWarningBanner.visible ? gpuWarningBanner.height + Theme.spacingS : 0) - (routingWarningBanner.visible ? routingWarningBanner.height + Theme.spacingS : 0) - (gpuCardsRow.visible ? gpuCardsRow.height + Theme.spacingS : 0) - 30 - Theme.spacingS * 3)
 
                     // ================= TAB 0: ACTIVE GPU PROCESSES =================
                     Column {
@@ -805,6 +863,16 @@ PluginComponent {
                                                         root.expandedProcessKey = procCard.expanded ? "" : procCard.rowKey;
                                                     }
                                                 }
+                                            }
+
+                                            // Inline diagnostic warning when a process bypassed its pinned GPU rule
+                                            StyledText {
+                                                visible: Boolean(procCard.procData.rule_warning)
+                                                width: parent.width
+                                                wrapMode: Text.WordWrap
+                                                text: procCard.procData.rule_warning || ""
+                                                font.pixelSize: Theme.fontSizeSmall - 2
+                                                color: Theme.warning
                                             }
 
                                             // Expanded per-process GPU routing actions
@@ -1044,7 +1112,7 @@ PluginComponent {
                                                         iconName: "push_pin"
                                                         highlighted: appCard.appData.effective_gpu === sel
                                                         onClicked: RenderRouteService.setRule(
-                                                            appCard.appData.binary || appCard.appData.id,
+                                                            appCard.appData.steam_app_id ? appCard.appData.id : (appCard.appData.binary || appCard.appData.id),
                                                             sel,
                                                             appCard.appData.id,
                                                             appCard.appData.name,
@@ -1059,7 +1127,7 @@ PluginComponent {
                                                     iconName: "close"
                                                     danger: true
                                                     onClicked: RenderRouteService.removeRule(
-                                                        appCard.appData.binary || appCard.appData.id,
+                                                        appCard.appData.steam_app_id ? appCard.appData.id : (appCard.appData.binary || appCard.appData.id),
                                                         appCard.appData.id || ""
                                                     )
                                                 }

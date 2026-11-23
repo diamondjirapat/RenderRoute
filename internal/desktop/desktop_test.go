@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/diamondjirapat/RenderRoute/internal/config"
 	"github.com/diamondjirapat/RenderRoute/internal/gpu"
 )
 
@@ -268,5 +269,67 @@ Icon=dev.vencord.Vesktop
 	}
 	if strings.Contains(string(asRestored), "renderroute run") {
 		t.Errorf("expected autostart Exec to be unwrapped after reset:\n%s", string(asRestored))
+	}
+}
+
+func TestSteamGameShortcutsDoNotCollideWithSteamClientRule(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"steam.desktop": `[Desktop Entry]
+Type=Application
+Name=Steam
+Exec=/usr/bin/steam %U
+Icon=steam
+`,
+		"Detroit Become Human.desktop": `[Desktop Entry]
+Type=Application
+Name=Detroit: Become Human
+Exec=steam steam://rungameid/1222140
+Icon=steam_icon_1222140
+`,
+		"Deadlock.desktop": `[Desktop Entry]
+Type=Application
+Name=Deadlock
+Exec=steam steam://rungameid/1422450
+Icon=steam_icon_1422450
+`,
+	}
+	for name, content := range files {
+		_ = os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644)
+	}
+
+	cfg := config.Default()
+	cfg.SetRule(config.Rule{Target: "steam", DesktopID: "steam", GPU: "igpu"})
+	cfg.SetRule(config.Rule{Target: "Detroit Become Human", DesktopID: "Detroit Become Human", GPU: "dgpu"})
+
+	apps := DiscoverAppsFrom([]string{dir}, cfg, "")
+	byID := map[string]App{}
+	for _, a := range apps {
+		byID[a.ID] = a
+	}
+
+	if byID["steam"].SteamAppID != "" || byID["steam"].EffectiveGPU != "igpu" {
+		t.Errorf("steam client entry unexpected: %+v", byID["steam"])
+	}
+	if byID["Detroit Become Human"].SteamAppID != "1222140" || byID["Detroit Become Human"].EffectiveGPU != "dgpu" {
+		t.Errorf("Detroit Become Human entry unexpected: %+v", byID["Detroit Become Human"])
+	}
+	if byID["Detroit Become Human"].DefaultRuleTarget() != "Detroit Become Human" {
+		t.Errorf("expected DefaultRuleTarget to use app ID for Steam game, got %q", byID["Detroit Become Human"].DefaultRuleTarget())
+	}
+	// Deadlock has no rule and must NOT inherit Steam's igpu rule via app.Binary=="steam"
+	if byID["Deadlock"].SteamAppID != "1422450" || byID["Deadlock"].EffectiveGPU != "" {
+		t.Errorf("Deadlock should not inherit steam client rule: %+v", byID["Deadlock"])
+	}
+
+	// FindApp must match steam_app_<appid> directly to the Steam game shortcut
+	gotDeadlock, err := FindApp(apps, "steam_app_1422450")
+	if err != nil || gotDeadlock.ID != "Deadlock" {
+		t.Fatalf("FindApp(steam_app_1422450) = %+v, %v; want Deadlock", gotDeadlock, err)
+	}
+	// FindApp("steam") must match the Steam client, not a Steam game
+	gotSteam, err := FindApp(apps, "steam")
+	if err != nil || gotSteam.ID != "steam" {
+		t.Fatalf("FindApp(steam) = %+v, %v; want steam", gotSteam, err)
 	}
 }
