@@ -57,7 +57,7 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 	byPCISlot := map[string]gpu.GPU{}
 	nvidiaByOrdinal := map[int]gpu.GPU{}
 	nvOrd := 0
-	nvAwake := false
+	nvAwake := map[string]bool{}
 	for _, g := range gpus {
 		if g.CardPath != "" {
 			byDevPath[g.CardPath] = g
@@ -73,7 +73,7 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 			byDevPath[fmt.Sprintf("/dev/nvidia%d", nvOrd)] = g
 			nvOrd++
 			if g.PowerState != "suspended" {
-				nvAwake = true
+				nvAwake[g.ID] = true
 			}
 		}
 	}
@@ -84,6 +84,10 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 		gpuID string
 	}
 	found := map[key]*GPUProcess{}
+	// NVIDIA GPUs (by ID) with at least one visible active client. nvidia-smi is only run for
+	// these: every nvidia-smi call resets the runtime-PM autosuspend timer, so querying an
+	// awake-but-idle dGPU on each poll would stop it from ever suspending.
+	nvInUse := map[string]bool{}
 
 	// 1. Scan /proc/<pid>/fd and /proc/<pid>/fdinfo
 	procEntries, err := os.ReadDir(procRoot)
@@ -157,6 +161,14 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 
 				if ok {
 					matchedGPUs[matched.ID] = matched
+					if matched.Driver == "nvidia" && strings.HasPrefix(target, "/dev/nvidia") {
+						nvInUse[matched.ID] = true
+					}
+				}
+			}
+			for gpuID, g := range matchedGPUs {
+				if g.Driver == "nvidia" && hasDRMActivity[gpuID] {
+					nvInUse[gpuID] = true
 				}
 			}
 
@@ -208,9 +220,16 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 		}
 	}
 
-	// 2. Enrich from nvidia-smi (only if NVIDIA GPU is awake!)
-	if allowNvidiaSMI && nvAwake && len(nvidiaByOrdinal) > 0 {
-		nvProcs := queryNvidiaSMIProcesses(nvidiaByOrdinal, byPCISlot)
+	// 2. Enrich from nvidia-smi (only for NVIDIA GPUs that are awake AND already in use)
+	var nvQuerySlots []string
+	for _, g := range nvidiaByOrdinal {
+		if nvAwake[g.ID] && nvInUse[g.ID] && g.PCISlot != "" {
+			nvQuerySlots = append(nvQuerySlots, g.PCISlot)
+		}
+	}
+	sort.Strings(nvQuerySlots)
+	if allowNvidiaSMI && len(nvQuerySlots) > 0 {
+		nvProcs := queryNvidiaSMIProcesses(nvidiaByOrdinal, byPCISlot, nvQuerySlots)
 		for _, np := range nvProcs {
 			if np.pid == myPID {
 				continue
@@ -256,6 +275,16 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 		}
 	}
 
+	// GPUs each PID is active on (a process can legitimately hold contexts on several GPUs,
+	// e.g. rendering on the dGPU while importing buffers on the iGPU).
+	pidGPUs := map[int]map[string]bool{}
+	for k := range found {
+		if pidGPUs[k.pid] == nil {
+			pidGPUs[k.pid] = map[string]bool{}
+		}
+		pidGPUs[k.pid][k.gpuID] = true
+	}
+
 	// Annotate rule matches and diagnose bypass/mismatch causes
 	out := make([]GPUProcess, 0, len(found))
 	for _, p := range found {
@@ -263,7 +292,8 @@ func listGPUProcessesFrom(procRoot string, gpus []gpu.GPU, cfg *config.Config, a
 			if rule, ok := cfg.MatchRule(p.Name, p.Exe, p.DesktopID); ok {
 				p.RuleGPU = rule.GPU
 				if resolved, err := gpu.Resolve(gpus, rule.GPU); err == nil {
-					matches := resolved.ID == p.GPUID
+					// The rule is honored if the process is active on its pinned GPU at all.
+					matches := pidGPUs[p.PID][resolved.ID]
 					p.RuleMatches = &matches
 					if !matches {
 						pidDir := filepath.Join(procRoot, strconv.Itoa(p.PID))
@@ -306,16 +336,17 @@ type nvProcEntry struct {
 	gpu      gpu.GPU
 }
 
-func queryNvidiaSMIProcesses(byOrd map[int]gpu.GPU, bySlot map[string]gpu.GPU) []nvProcEntry {
+func queryNvidiaSMIProcesses(byOrd map[int]gpu.GPU, bySlot map[string]gpu.GPU, slots []string) []nvProcEntry {
 	var out []nvProcEntry
 	seen := map[string]bool{}
+	idArg := "--id=" + strings.Join(slots, ",")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), gpu.NvidiaSMITimeout)
 	defer cancel()
 
-	// Query both compute and graphics processes via nvidia-smi --query-compute-apps (includes graphics on modern drivers)
-	// with gpu_bus_id so multi-NVIDIA setups map accurately.
-	cmd := exec.CommandContext(ctx, "nvidia-smi",
+	// Query compute processes via nvidia-smi --query-compute-apps with gpu_bus_id so multi-NVIDIA
+	// setups map accurately (restricted to in-use GPUs so idle ones are not woken).
+	cmd := exec.CommandContext(ctx, "nvidia-smi", idArg,
 		"--query-compute-apps=gpu_bus_id,pid,process_name,used_gpu_memory",
 		"--format=csv,noheader,nounits",
 	)
@@ -331,10 +362,11 @@ func queryNvidiaSMIProcesses(byOrd map[int]gpu.GPU, bySlot map[string]gpu.GPU) [
 			slot := gpu.NormalizePCISlot(cols[0])
 			g, ok := bySlot[slot]
 			if !ok {
-				g, ok = byOrd[0]
-				if !ok {
+				// Ambiguous mapping is only safe when there is a single NVIDIA GPU.
+				if len(byOrd) != 1 {
 					continue
 				}
+				g = byOrd[0]
 			}
 			pid, err := strconv.Atoi(strings.TrimSpace(cols[1]))
 			if err != nil || pid <= 0 {
@@ -353,9 +385,9 @@ func queryNvidiaSMIProcesses(byOrd map[int]gpu.GPU, bySlot map[string]gpu.GPU) [
 	}
 
 	// Also try pmon -c 1 -s m to catch pure graphics-only apps on older drivers where compute-apps omits them
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), gpu.NvidiaSMITimeout)
 	defer cancel2()
-	cmd2 := exec.CommandContext(ctx2, "nvidia-smi", "pmon", "-c", "1", "-s", "m")
+	cmd2 := exec.CommandContext(ctx2, "nvidia-smi", "pmon", "-i", strings.Join(slots, ","), "-c", "1", "-s", "m")
 	if raw, err := cmd2.Output(); err == nil {
 		for _, line := range strings.Split(string(raw), "\n") {
 			line = strings.TrimSpace(line)
@@ -410,8 +442,9 @@ func parseFDInfo(path string) map[string]string {
 }
 
 func parseDRMMemoryMB(info map[string]string) (float64, bool) {
-	// Support AMD/Intel/Mesa fdinfo memory keys
-	for _, k := range []string{"drm-resident-vram", "drm-memory-vram", "drm-resident-local0", "drm-memory-gtt"} {
+	// Device-local memory keys only (amdgpu "vram", xe "vram0", i915 "local0"). GTT/system regions
+	// are host RAM mapped for the GPU and are deliberately not reported as VRAM.
+	for _, k := range []string{"drm-resident-vram", "drm-memory-vram", "drm-resident-vram0", "drm-resident-local0"} {
 		raw, ok := info[k]
 		if !ok || raw == "" {
 			continue
@@ -435,10 +468,9 @@ func parseDRMMemoryMB(info map[string]string) (float64, bool) {
 			return val, true
 		case "gib", "gb":
 			return val * 1024.0, true
-		case "b", "bytes":
-			return val / (1024.0 * 1024.0), true
 		default:
-			return val / 1024.0, true
+			// Per the DRM fdinfo spec the default (unit-less) unit is bytes.
+			return val / (1024.0 * 1024.0), true
 		}
 	}
 	return 0, false
@@ -759,6 +791,36 @@ func readProcEnvironMap(pidDir string) (map[string]string, bool) {
 	return res, true
 }
 
+// sandboxedFlatpakID returns the Flatpak app ID only if the process runs inside a Flatpak sandbox,
+// i.e. its root filesystem carries /.flatpak-info. Inherited FLATPAK_* env vars or cgroup scope
+// names are not sufficient: host processes spawned from a Flatpak app also carry them.
+func sandboxedFlatpakID(pidDir string) string {
+	b, err := os.ReadFile(filepath.Join(pidDir, "root", ".flatpak-info"))
+	if err != nil || len(b) == 0 {
+		return ""
+	}
+	inApp := false
+	for _, line := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+			inApp = t == "[Application]"
+			continue
+		}
+		if inApp && strings.HasPrefix(t, "name=") {
+			return strings.TrimSpace(strings.TrimPrefix(t, "name="))
+		}
+	}
+	return ""
+}
+
+// RuleCandidates returns the rule lookup keys (process name, executable path, desktop/app ID)
+// for a running process, matching what ListGPUProcesses uses for rule annotation.
+func RuleCandidates(pid int) []string {
+	pidDir := filepath.Join("/proc", strconv.Itoa(pid))
+	name, exe, cmdline, _ := readProcMeta(pidDir, os.Getuid())
+	return []string{name, exe, detectProcessDesktopID(pidDir, exe, cmdline)}
+}
+
 // RelaunchResult describes the result of restarting a running process on a target GPU.
 type RelaunchResult struct {
 	OldPID  int      `json:"old_pid"`
@@ -801,7 +863,6 @@ func RelaunchProcess(pid int, target gpu.GPU, allGPUs []gpu.GPU, extraEnv map[st
 	exePath, _ := os.Readlink(filepath.Join(pidDir, "exe"))
 	exePath = strings.TrimSuffix(exePath, " (deleted)")
 	cwd, _ := os.Readlink(filepath.Join(pidDir, "cwd"))
-	desktopID := detectProcessDesktopID(pidDir, exePath, strings.Join(argv, " "))
 
 	// Resolve binary path; for Flatpak sandboxed processes (whose /app/... path does not exist on host),
 	// relaunch cleanly via `flatpak run <app-id>`.
@@ -813,10 +874,27 @@ func RelaunchProcess(pid int, target gpu.GPU, allGPUs []gpu.GPU, extraEnv map[st
 			bin = exePath
 		}
 	}
-	if _, statErr := os.Stat(bin); statErr != nil && desktopID != "" {
-		if flatpakBin, err := exec.LookPath("flatpak"); err == nil {
-			argv = []string{flatpakBin, "run", desktopID}
-			bin = flatpakBin
+	// Only fall back to `flatpak run` for processes that really run inside a Flatpak sandbox.
+	// detectProcessDesktopID also matches host processes that merely inherited FLATPAK_XDG_* vars
+	// (e.g. spawned via `flatpak-spawn --host` from a Flatpak terminal/editor) or launcher scopes;
+	// "relaunching" those as `flatpak run <id>` would start a completely different application.
+	if _, statErr := os.Stat(bin); statErr != nil {
+		if fpID := sandboxedFlatpakID(pidDir); fpID != "" {
+			if flatpakBin, err := exec.LookPath("flatpak"); err == nil {
+				argv = []string{flatpakBin, "run", fpID}
+				bin = flatpakBin
+				cwd = ""
+			}
+		}
+	}
+
+	// Validate that the process can actually be restarted BEFORE terminating it, so a failed
+	// relaunch never leaves the user with a killed application.
+	if _, err := exec.LookPath(bin); err != nil {
+		return nil, fmt.Errorf("cannot relaunch pid %d: executable %q is not available (%v); process left running", pid, bin, err)
+	}
+	if cwd != "" {
+		if st, err := os.Stat(cwd); err != nil || !st.IsDir() {
 			cwd = ""
 		}
 	}

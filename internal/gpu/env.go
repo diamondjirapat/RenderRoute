@@ -2,9 +2,11 @@ package gpu
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -44,15 +46,8 @@ func BuildRoutingEnv(target GPU, allGPUs []GPU) RoutingEnv {
 			nvIdx++
 		}
 		set["CUDA_VISIBLE_DEVICES"] = fmt.Sprintf("%d", nvIdx)
-
-		if len(target.VulkanICDs) > 0 {
-			joined := strings.Join(target.VulkanICDs, ":")
-			set["VK_DRIVER_FILES"] = joined
-			set["VK_ICD_FILENAMES"] = joined
-		}
-		if len(target.EGLVendors) > 0 {
-			set["__EGL_VENDOR_LIBRARY_FILENAMES"] = strings.Join(target.EGLVendors, ":")
-		}
+		// CUDA enumerates "fastest first" by default; the ordinal above is in PCI bus order.
+		set["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
 		// Clear Mesa-specific and AMD ROCm routing variables that might be inherited
 		unset = []string{
@@ -75,12 +70,6 @@ func BuildRoutingEnv(target GPU, allGPUs []GPU) RoutingEnv {
 
 		set["__GLX_VENDOR_LIBRARY_NAME"] = "mesa"
 
-		if len(target.VulkanICDs) > 0 {
-			joined := strings.Join(target.VulkanICDs, ":")
-			set["VK_DRIVER_FILES"] = joined
-			set["VK_ICD_FILENAMES"] = joined
-		}
-
 		// Mesa Vulkan device-select layer strict selection ("vendor:device!")
 		vHex := strings.TrimPrefix(strings.ToLower(target.VendorID), "0x")
 		dHex := strings.TrimPrefix(strings.ToLower(target.DeviceID), "0x")
@@ -88,15 +77,12 @@ func BuildRoutingEnv(target GPU, allGPUs []GPU) RoutingEnv {
 			set["MESA_VK_DEVICE_SELECT"] = fmt.Sprintf("%s:%s!", vHex, dHex)
 		}
 
-		if len(target.EGLVendors) > 0 {
-			set["__EGL_VENDOR_LIBRARY_FILENAMES"] = strings.Join(target.EGLVendors, ":")
-		}
-
 		// Explicitly strip NVIDIA offload variables if inherited
 		unset = []string{
 			"__NV_PRIME_RENDER_OFFLOAD",
 			"__NV_PRIME_RENDER_OFFLOAD_PROVIDER",
 			"__VK_LAYER_NV_optimus",
+			"CUDA_DEVICE_ORDER",
 			"CUDA_VISIBLE_DEVICES",
 		}
 
@@ -107,21 +93,32 @@ func BuildRoutingEnv(target GPU, allGPUs []GPU) RoutingEnv {
 		case "amd":
 			set["LIBVA_DRIVER_NAME"] = "radeonsi"
 			set["VDPAU_DRIVER"] = "radeonsi"
-			amdIdx := 0
-			for _, g := range allGPUs {
-				if g.Vendor != "amd" {
-					continue
-				}
-				if g.ID == target.ID {
-					break
-				}
-				amdIdx++
+			// ROCm numbers devices by KFD topology node order (which includes supported APUs),
+			// so derive the ordinal from KFD rather than guessing from DRM discovery order.
+			if idx, ok := rocmDeviceIndex(target.PCISlot); ok {
+				set["ROCR_VISIBLE_DEVICES"] = fmt.Sprintf("%d", idx)
+				set["HIP_VISIBLE_DEVICES"] = fmt.Sprintf("%d", idx)
+			} else {
+				unset = append(unset, "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
 			}
-			set["ROCR_VISIBLE_DEVICES"] = fmt.Sprintf("%d", amdIdx)
-			set["HIP_VISIBLE_DEVICES"] = fmt.Sprintf("%d", amdIdx)
 		default:
-			unset = append(unset, "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
+			unset = append(unset, "HIP_VISIBLE_DEVICES", "LIBVA_DRIVER_NAME", "ROCR_VISIBLE_DEVICES", "VDPAU_DRIVER")
 		}
+	}
+
+	// Vulkan ICD / EGL vendor manifests: pin to the target's manifests when found; otherwise clear any
+	// inherited values (e.g. from a parent pinned to another GPU) so loaders fall back to their defaults.
+	if len(target.VulkanICDs) > 0 {
+		joined := strings.Join(target.VulkanICDs, ":")
+		set["VK_DRIVER_FILES"] = joined
+		set["VK_ICD_FILENAMES"] = joined
+	} else {
+		unset = append(unset, "VK_DRIVER_FILES", "VK_ICD_FILENAMES")
+	}
+	if len(target.EGLVendors) > 0 {
+		set["__EGL_VENDOR_LIBRARY_FILENAMES"] = strings.Join(target.EGLVendors, ":")
+	} else {
+		unset = append(unset, "__EGL_VENDOR_LIBRARY_FILENAMES")
 	}
 
 	sort.Strings(unset)
@@ -130,6 +127,79 @@ func BuildRoutingEnv(target GPU, allGPUs []GPU) RoutingEnv {
 		Set:   set,
 		Unset: unset,
 	}
+}
+
+// kfdTopologyRoot is the amdkfd topology directory (overridable in tests).
+var kfdTopologyRoot = "/sys/class/kfd/kfd/topology/nodes"
+
+// rocmDeviceIndex returns the ROCm (ROCR/HIP) device ordinal of the GPU at pciSlot by walking
+// KFD topology nodes in node order and counting GPU nodes (simd_count > 0).
+func rocmDeviceIndex(pciSlot string) (int, bool) {
+	domain, locationID, ok := pciLocation(pciSlot)
+	if !ok {
+		return 0, false
+	}
+	entries, err := os.ReadDir(kfdTopologyRoot)
+	if err != nil {
+		return 0, false
+	}
+	var nodes []int
+	for _, e := range entries {
+		if n, err := strconv.Atoi(e.Name()); err == nil {
+			nodes = append(nodes, n)
+		}
+	}
+	sort.Ints(nodes)
+	gpuIdx := 0
+	for _, n := range nodes {
+		props := parseKFDProperties(filepath.Join(kfdTopologyRoot, strconv.Itoa(n), "properties"))
+		if props["simd_count"] <= 0 {
+			continue // CPU-only node
+		}
+		if props["location_id"] == locationID && props["domain"] == domain {
+			return gpuIdx, true
+		}
+		gpuIdx++
+	}
+	return 0, false
+}
+
+// pciLocation converts "dddd:bb:dd.f" to (domain, KFD location_id = bus<<8 | dev<<3 | fn).
+func pciLocation(slot string) (domain, locationID int64, ok bool) {
+	parts := strings.Split(NormalizePCISlot(slot), ":")
+	if len(parts) != 3 {
+		return 0, 0, false
+	}
+	devFn := strings.Split(parts[2], ".")
+	if len(devFn) != 2 {
+		return 0, 0, false
+	}
+	dom, err1 := strconv.ParseInt(parts[0], 16, 64)
+	bus, err2 := strconv.ParseInt(parts[1], 16, 64)
+	dev, err3 := strconv.ParseInt(devFn[0], 16, 64)
+	fn, err4 := strconv.ParseInt(devFn[1], 16, 64)
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+		return 0, 0, false
+	}
+	return dom, bus<<8 | dev<<3 | fn, true
+}
+
+func parseKFDProperties(path string) map[string]int64 {
+	res := map[string]int64{}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return res
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		if v, err := strconv.ParseInt(f[1], 10, 64); err == nil {
+			res[f[0]] = v
+		}
+	}
+	return res
 }
 
 // IsFlatpakCommand reports whether argv launches an application via `flatpak run ...`

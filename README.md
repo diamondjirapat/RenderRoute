@@ -11,7 +11,7 @@
 ## Features
 
 - **Automatic Multi-GPU Discovery** (`/sys/class/drm`, `/dev/dri`, `lspci`, Vulkan ICDs, EGL vendors) with stable PCI-slot identification and automatic `iGPU` / `dGPU` classification.
-- **Sleep-Safe Telemetry**: Reads `/sys/class/drm/card*/device/power/runtime_status` first and **never invokes `nvidia-smi` when a laptop dGPU is runtime-suspended**, avoiding unnecessary battery drain.
+- **Sleep-Safe Telemetry**: Reads `/sys/class/drm/card*/device/power/runtime_status` first and **never invokes `nvidia-smi` when a laptop dGPU is runtime-suspended** — and the polled `status` command only queries `nvidia-smi` for NVIDIA GPUs that already have active clients, so an idle dGPU is free to autosuspend.
 - **Complete Multi-API GPU Routing**: Generates the exact OpenGL/GLX, EGL, Vulkan (`VK_DRIVER_FILES`, `VK_ICD_FILENAMES`, `MESA_VK_DEVICE_SELECT`), PRIME (`__NV_PRIME_RENDER_OFFLOAD`, `DRI_PRIME=pci-...`), VA-API (`LIBVA_DRIVER_NAME`), and CUDA/ROCm environment variables while stripping conflicting variables from other vendors.
 - **Live GPU Process Monitor**: Combines `/proc/<pid>/fd`, `/proc/<pid>/fdinfo`, and `nvidia-smi` to show which running processes are bound to which GPU (with VRAM usage and rule-mismatch detection).
 - **Per-Process & Per-App Persistent Rules**: Stored in `~/.config/renderroute/config.json`, plus safe user-local `.desktop` launcher overrides in `~/.local/share/applications/` (`desktop apply` / `desktop reset`) so launching an app from any launcher honors your chosen GPU.

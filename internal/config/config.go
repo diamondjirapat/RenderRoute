@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // Rule maps a process executable name or desktop app ID to a preferred GPU selector.
@@ -47,6 +48,8 @@ func Default() *Config {
 }
 
 // Load reads config from the default XDG path.
+// It never returns a nil *Config: on error, defaults are returned alongside the error so
+// read-only callers can keep working while mutating callers can refuse to overwrite the file.
 func Load() (*Config, error) {
 	p, err := ConfigPath()
 	if err != nil {
@@ -56,17 +59,18 @@ func Load() (*Config, error) {
 }
 
 // LoadFrom reads config from a specific file path, returning defaults if it doesn't exist.
+// It never returns a nil *Config; on read/parse errors it returns defaults plus the error.
 func LoadFrom(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return Default(), nil
 		}
-		return nil, fmt.Errorf("read config %s: %w", path, err)
+		return Default(), fmt.Errorf("read config %s: %w", path, err)
 	}
 	cfg := Default()
 	if err := json.Unmarshal(b, cfg); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
+		return Default(), fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if cfg.Rules == nil {
 		cfg.Rules = map[string]Rule{}
@@ -86,12 +90,13 @@ func (c *Config) Save() error {
 	return c.SaveTo(p)
 }
 
-// SaveTo writes config atomically to path.
+// SaveTo writes config atomically to path (unique temp file + fsync + rename).
 func (c *Config) SaveTo(path string) error {
 	if c.Rules == nil {
 		c.Rules = map[string]Rule{}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
@@ -99,11 +104,66 @@ func (c *Config) SaveTo(path string) error {
 		return err
 	}
 	data = append(data, '\n')
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return err
+	}
+	return nil
+}
+
+// Lock takes an exclusive advisory lock guarding read-modify-write cycles on the default
+// config file, so concurrent renderroute invocations (e.g. from the DMS widget) don't
+// overwrite each other's changes. Call the returned function to release it.
+func Lock() (func(), error) {
+	p, err := ConfigPath()
+	if err != nil {
+		return func() {}, err
+	}
+	return LockPath(p)
+}
+
+// LockPath takes an exclusive advisory lock on "<path>.lock".
+func LockPath(path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return func() {}, err
+	}
+	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return func() {}, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return func() {}, fmt.Errorf("lock config %s: %w", path, err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }
 
 // NormalizeKey normalizes a process name, path, or desktop ID for consistent rule lookup.

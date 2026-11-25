@@ -38,23 +38,50 @@ type App struct {
 	EffectiveGPU   string `json:"effective_gpu,omitempty"` // Combined GPU preference
 }
 
-// ApplicationDirs returns XDG application directories in precedence order (user overrides first).
+// ApplicationDirs returns XDG application directories in precedence order (user overrides first):
+// $XDG_DATA_HOME, then each entry of $XDG_DATA_DIRS (default /usr/local/share:/usr/share).
+// Flatpak export directories are included even when the session did not add them to XDG_DATA_DIRS.
 func ApplicationDirs() []string {
 	home, _ := os.UserHomeDir()
+	dataHome := os.Getenv("XDG_DATA_HOME")
+	if dataHome == "" && home != "" {
+		dataHome = filepath.Join(home, ".local", "share")
+	}
+	dataDirsEnv := os.Getenv("XDG_DATA_DIRS")
+	if strings.TrimSpace(dataDirsEnv) == "" {
+		dataDirsEnv = "/usr/local/share:/usr/share"
+	}
+	var dataDirs []string
+	for _, d := range strings.Split(dataDirsEnv, ":") {
+		if d = strings.TrimSpace(d); d != "" && filepath.IsAbs(d) {
+			dataDirs = append(dataDirs, d)
+		}
+	}
+	return applicationDirsFrom(dataHome, dataDirs)
+}
+
+func applicationDirsFrom(dataHome string, dataDirs []string) []string {
+	seen := map[string]bool{}
 	var dirs []string
-	if xdgData := os.Getenv("XDG_DATA_HOME"); xdgData != "" {
-		dirs = append(dirs, filepath.Join(xdgData, "applications"))
-	} else if home != "" {
-		dirs = append(dirs, filepath.Join(home, ".local", "share", "applications"))
+	add := func(base string) {
+		if base == "" {
+			return
+		}
+		d := filepath.Clean(filepath.Join(base, "applications"))
+		if !seen[d] {
+			seen[d] = true
+			dirs = append(dirs, d)
+		}
 	}
-	if home != "" {
-		dirs = append(dirs, filepath.Join(home, ".local", "share", "flatpak", "exports", "share", "applications"))
+	add(dataHome)
+	// Flatpak exports take precedence over distro packages (matching Flatpak's own profile.d ordering).
+	if dataHome != "" {
+		add(filepath.Join(dataHome, "flatpak", "exports", "share"))
 	}
-	dirs = append(dirs,
-		"/var/lib/flatpak/exports/share/applications",
-		"/usr/local/share/applications",
-		"/usr/share/applications",
-	)
+	add("/var/lib/flatpak/exports/share")
+	for _, d := range dataDirs {
+		add(d)
+	}
 	return dirs
 }
 
@@ -107,11 +134,14 @@ func DiscoverAppsFrom(dirs []string, cfg *config.Config, query string) []App {
 				continue
 			}
 			fullPath := filepath.Join(dir, e.Name())
+			// Per the XDG spec the highest-precedence file for a desktop ID wins even when it is
+			// hidden (Hidden=true / NoDisplay=true is how users hide a system app), so mark the ID
+			// as seen before deciding whether it is visible.
+			seen[id] = true
 			app, ok := parseDesktopFile(id, fullPath)
 			if !ok {
 				continue
 			}
-			seen[id] = true
 
 			if cfg != nil {
 				if r, matched := cfg.MatchRule(app.RuleMatchCandidates()...); matched {
@@ -418,8 +448,12 @@ func ApplyDesktopOverrideIn(searchDirs []string, userDir, appID, gpuSelector, re
 	if err != nil {
 		return "", err
 	}
+	content := string(raw)
 
-	patched := patchDesktopContent(string(raw), gpuSelector, renderrouteBin, targetRole)
+	// If we are patching a pre-existing user file (not one RenderRoute generated from a system copy),
+	// mark it so ResetDesktopOverride restores it in place instead of deleting the user's own edits.
+	preexistingUserFile := filepath.Clean(filepath.Dir(srcPath)) == filepath.Clean(userDir) && !isManagedDesktopContent(content)
+	patched := patchDesktopContentOpts(content, gpuSelector, renderrouteBin, targetRole, preexistingUserFile)
 
 	if err := os.MkdirAll(userDir, 0o755); err != nil {
 		return "", err
@@ -431,7 +465,18 @@ func ApplyDesktopOverrideIn(searchDirs []string, userDir, appID, gpuSelector, re
 	return dstPath, nil
 }
 
+// userOverrideKey marks a patched user-local .desktop file that existed before RenderRoute touched it.
+const userOverrideKey = "X-RenderRoute-User-Override"
+
+func isManagedDesktopContent(content string) bool {
+	return strings.Contains(content, managedHeaderPrefix) || strings.Contains(content, "X-RenderRoute-GPU=")
+}
+
 func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole gpu.Role) string {
+	return patchDesktopContentOpts(content, gpuSelector, renderrouteBin, targetRole, false)
+}
+
+func patchDesktopContentOpts(content, gpuSelector, renderrouteBin string, targetRole gpu.Role, userOverride bool) string {
 	lines := strings.Split(content, "\n")
 	var out []string
 	inEntry := false
@@ -460,6 +505,10 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 				origPrefers = val
 			case "X-RenderRoute-Original-KDE-RunOnDiscreteGpu":
 				origKDERunDiscrete = val
+			case userOverrideKey:
+				if strings.EqualFold(val, "true") {
+					userOverride = true
+				}
 			}
 		}
 	}
@@ -489,6 +538,9 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 		}
 		if origKDERunDiscrete != "" {
 			out = append(out, "X-RenderRoute-Original-KDE-RunOnDiscreteGpu="+origKDERunDiscrete)
+		}
+		if userOverride {
+			out = append(out, userOverrideKey+"=true")
 		}
 		wroteMeta = true
 	}
@@ -521,7 +573,8 @@ func patchDesktopContent(content, gpuSelector, renderrouteBin string, targetRole
 					"X-RenderRoute-Original-Exec",
 					"X-RenderRoute-Original-DBusActivatable",
 					"X-RenderRoute-Original-PrefersNonDefaultGPU",
-					"X-RenderRoute-Original-KDE-RunOnDiscreteGpu":
+					"X-RenderRoute-Original-KDE-RunOnDiscreteGpu",
+					userOverrideKey:
 					continue
 				case "PrefersNonDefaultGPU":
 					if origPrefers == "" && !strings.Contains(content, "X-RenderRoute-GPU=") {
@@ -597,11 +650,12 @@ func ResetDesktopOverrideIn(searchDirs []string, userDir, appID string) (bool, e
 	}
 
 	content := string(raw)
-	if !strings.Contains(content, managedHeaderPrefix) && !strings.Contains(content, "X-RenderRoute-GPU=") {
+	if !isManagedDesktopContent(content) {
 		return false, nil
 	}
 
-	// Check if a backing system/flatpak .desktop file exists
+	// Check if a backing system/flatpak .desktop file exists. A user file that pre-dated RenderRoute
+	// (marked with X-RenderRoute-User-Override) is always restored in place, never deleted.
 	hasSystemCopy := false
 	for _, dir := range searchDirs {
 		if filepath.Clean(dir) == filepath.Clean(userDir) {
@@ -613,7 +667,7 @@ func ResetDesktopOverrideIn(searchDirs []string, userDir, appID string) (bool, e
 		}
 	}
 
-	if hasSystemCopy {
+	if hasSystemCopy && !desktopHasUserOverrideMarker(content) {
 		if err := os.Remove(userFile); err != nil {
 			return false, err
 		}
@@ -626,6 +680,15 @@ func ResetDesktopOverrideIn(searchDirs []string, userDir, appID string) (bool, e
 		return false, err
 	}
 	return true, nil
+}
+
+func desktopHasUserOverrideMarker(content string) bool {
+	for _, l := range strings.Split(content, "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(l), "="); ok && strings.TrimSpace(k) == userOverrideKey {
+			return strings.EqualFold(strings.TrimSpace(v), "true")
+		}
+	}
+	return false
 }
 
 func unpatchDesktopContent(content string) string {
@@ -675,7 +738,8 @@ func unpatchDesktopContent(content string) string {
 					"X-RenderRoute-Original-Exec",
 					"X-RenderRoute-Original-DBusActivatable",
 					"X-RenderRoute-Original-PrefersNonDefaultGPU",
-					"X-RenderRoute-Original-KDE-RunOnDiscreteGpu":
+					"X-RenderRoute-Original-KDE-RunOnDiscreteGpu",
+					userOverrideKey:
 					continue
 				case "PrefersNonDefaultGPU":
 					if origPrefers != "" {

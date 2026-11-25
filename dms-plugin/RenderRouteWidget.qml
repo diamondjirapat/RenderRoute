@@ -729,7 +729,7 @@ PluginComponent {
                             }
 
                             MiniChipButton {
-                                label: `iGPU (${Math.max(0, RenderRouteService.totalProcesses - RenderRouteService.dgpuProcessCount)})`
+                                label: `iGPU (${(RenderRouteService.processes || []).filter(p => p.gpu_role === "igpu").length})`
                                 iconName: "eco"
                                 highlighted: root.processFilter === "igpu"
                                 onClicked: root.processFilter = "igpu"

@@ -215,7 +215,7 @@ func DiscoverFrom(sysDRMRoot, devDRIRoot string, includeMetrics bool) ([]GPU, er
 	}
 
 	if includeMetrics {
-		populateMetrics(gpus, sysDRMRoot)
+		populateMetrics(gpus, sysDRMRoot, nil)
 	}
 
 	return gpus, nil
@@ -236,32 +236,26 @@ func roleRank(r Role) int {
 func classifyRoles(gpus []GPU) {
 	for i := range gpus {
 		g := &gpus[i]
-		// Integrated GPUs typically sit on PCI bus 00:02.0 (Intel) or are boot_vga non-NVIDIA,
-		// or AMD APUs with boot_vga on bus 00 / low bus.
+		// Integrated GPUs: Intel iGPUs sit on PCI bus 00 (00:02.0); AMD APUs are identified by
+		// device ID / name; unknown vendors fall back to boot_vga.
 		switch g.Vendor {
 		case "nvidia":
 			g.Role = RoleDiscrete
 		case "intel":
 			// Intel Arc discrete cards usually live on non-zero PCI bus (e.g., 03:00.0),
 			// whereas Intel integrated UHD/Iris/Arc iGPU sits at 0000:00:02.0.
+			// boot_vga is not used here: an Arc card is the boot VGA device on desktops without an iGPU.
 			if strings.HasPrefix(g.PCISlot, "0000:00:") {
 				g.Role = RoleIntegrated
-			} else if g.BootVGA {
+			} else if g.PCISlot == "" && g.BootVGA {
 				g.Role = RoleIntegrated
 			} else {
 				g.Role = RoleDiscrete
 			}
 		case "amd":
-			if g.BootVGA && len(gpus) > 1 {
-				g.Role = RoleIntegrated
-			} else if strings.Contains(strings.ToLower(g.Name), "raphael") ||
-				strings.Contains(strings.ToLower(g.Name), "phoenix") ||
-				strings.Contains(strings.ToLower(g.Name), "rembrandt") ||
-				strings.Contains(strings.ToLower(g.Name), "cezanne") ||
-				strings.Contains(strings.ToLower(g.Name), "renoir") ||
-				strings.Contains(strings.ToLower(g.Name), "vega") && g.BootVGA {
-				g.Role = RoleIntegrated
-			} else if g.BootVGA {
+			// boot_vga is NOT a reliable iGPU signal for AMD: desktop firmware usually selects the
+			// discrete card as boot VGA. Identify APUs by PCI device ID or APU/iGPU naming instead.
+			if isAMDAPU(g.DeviceID, g.Name) {
 				g.Role = RoleIntegrated
 			} else {
 				g.Role = RoleDiscrete
@@ -275,7 +269,8 @@ func classifyRoles(gpus []GPU) {
 		}
 	}
 
-	// If there are multiple GPUs and none marked integrated, promote boot_vga.
+	// If there are multiple GPUs and none marked integrated, promote boot_vga
+	// (only for adapters whose role could not be determined from vendor-specific signals).
 	hasIGPU := false
 	for _, g := range gpus {
 		if g.Role == RoleIntegrated {
@@ -285,7 +280,7 @@ func classifyRoles(gpus []GPU) {
 	}
 	if !hasIGPU && len(gpus) > 1 {
 		for i := range gpus {
-			if gpus[i].BootVGA {
+			if gpus[i].BootVGA && gpus[i].Role == RoleUnknown {
 				gpus[i].Role = RoleIntegrated
 				break
 			}
@@ -293,11 +288,52 @@ func classifyRoles(gpus []GPU) {
 	}
 }
 
+// amdAPUDeviceIDs lists PCI device IDs of AMD APU integrated graphics (Raven through Strix/Krackan).
+var amdAPUDeviceIDs = map[string]bool{
+	"15dd": true, // Raven Ridge / Picasso
+	"15d8": true, // Picasso / Raven2
+	"1636": true, // Renoir
+	"1638": true, // Cezanne
+	"164c": true, // Lucienne
+	"15e7": true, // Barcelo
+	"163f": true, // Van Gogh
+	"1681": true, // Rembrandt
+	"1506": true, // Mendocino
+	"164e": true, // Raphael
+	"13c0": true, // Granite Ridge
+	"15bf": true, // Phoenix1
+	"15c8": true, // Phoenix2
+	"1900": true, // Phoenix3 / Hawk Point
+	"1901": true, // Phoenix4 / Hawk Point
+	"150e": true, // Strix Point
+	"1586": true, // Strix Halo
+	"1114": true, // Krackan Point
+}
+
+var amdAPUNameRe = regexp.MustCompile(`(?i)\b(raven|picasso|renoir|cezanne|lucienne|barcelo|van ?gogh|rembrandt|mendocino|raphael|granite ridge|phoenix\d*|hawk ?point|strix|krackan)\b|\bradeon (?:\d{3,4}m|\d{4}s|graphics|vega (?:series|mobile)|vega \d+ graphics)\b`)
+
+// isAMDAPU reports whether an AMD display adapter is an APU's integrated GPU.
+func isAMDAPU(deviceID, name string) bool {
+	id := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(deviceID)), "0x")
+	if amdAPUDeviceIDs[id] {
+		return true
+	}
+	return amdAPUNameRe.MatchString(name)
+}
+
+var (
+	// Specific model badges ("RTX 4050", "RX 7800", "Arc A770", "UHD 770", "Iris Xe") take precedence
+	// over the generic "Radeon <x>" badge so "Radeon RX 7800 XT" becomes "RX 7800" rather than "Radeon RX".
+	shortModelRe  = regexp.MustCompile(`(?i)\b(RTX|GTX|RX|Arc|UHD|Iris)\s*[A-Za-z0-9-]+`)
+	shortRadeonRe = regexp.MustCompile(`(?i)\bRadeon\s*[A-Za-z0-9-]+`)
+)
+
 func makeShortName(g GPU) string {
 	lower := strings.ToLower(g.Name)
-	// Extract concise model badge like "RTX 4050", "RX 7800", "Intel UHD", etc.
-	reModel := regexp.MustCompile(`(?i)\b(RTX|GTX|RX|Arc|UHD|Iris|Radeon)\s*[A-Za-z0-9-]+`)
-	if m := reModel.FindString(g.Name); m != "" {
+	if m := shortModelRe.FindString(g.Name); m != "" {
+		return strings.TrimSpace(m)
+	}
+	if m := shortRadeonRe.FindString(g.Name); m != "" {
 		return strings.TrimSpace(m)
 	}
 	switch {
@@ -492,17 +528,30 @@ func discoverEGLVendors(g GPU) []string {
 	return found
 }
 
-func populateMetrics(gpus []GPU, sysDRMRoot string) {
-	// Only invoke nvidia-smi if an NVIDIA GPU is NOT runtime-suspended (avoid waking sleeping dGPU!).
-	needNvidiaSMI := false
+// PopulateMetrics gathers live telemetry for already-discovered GPUs.
+//
+// nvidiaInUse limits nvidia-smi queries to NVIDIA GPUs (by ID) that have known active clients.
+// Every nvidia-smi invocation initializes NVML and resets the runtime-PM autosuspend timer, so
+// polling an awake-but-idle dGPU would keep it from ever suspending again. Pass nil to query
+// every awake NVIDIA GPU (appropriate for one-shot, user-initiated commands).
+func PopulateMetrics(gpus []GPU, nvidiaInUse map[string]bool) {
+	populateMetrics(gpus, "/sys/class/drm", nvidiaInUse)
+}
+
+func populateMetrics(gpus []GPU, sysDRMRoot string, nvidiaInUse map[string]bool) {
+	// Only invoke nvidia-smi for NVIDIA GPUs that are NOT runtime-suspended (avoid waking sleeping dGPU!).
+	var nvSlots []string
 	for _, g := range gpus {
-		if g.Driver == "nvidia" && g.PowerState != "suspended" {
-			needNvidiaSMI = true
-			break
+		if g.Driver != "nvidia" || g.PowerState == "suspended" || g.PCISlot == "" {
+			continue
 		}
+		if nvidiaInUse != nil && !nvidiaInUse[g.ID] {
+			continue
+		}
+		nvSlots = append(nvSlots, g.PCISlot)
 	}
-	if needNvidiaSMI {
-		populateNvidiaSMIMetrics(gpus)
+	if len(nvSlots) > 0 {
+		populateNvidiaSMIMetrics(gpus, nvSlots)
 	}
 
 	// Sysfs telemetry for AMD / Intel GPUs
@@ -533,10 +582,15 @@ func populateMetrics(gpus []GPU, sysDRMRoot string) {
 	}
 }
 
-func populateNvidiaSMIMetrics(gpus []GPU) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+// NvidiaSMITimeout bounds each nvidia-smi invocation so a hung driver cannot stall status polling.
+const NvidiaSMITimeout = 1500 * time.Millisecond
+
+func populateNvidiaSMIMetrics(gpus []GPU, slots []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), NvidiaSMITimeout)
 	defer cancel()
+	// Restrict the query to the given GPUs so other (possibly suspended) NVIDIA GPUs are not woken.
 	cmd := exec.CommandContext(ctx, "nvidia-smi",
+		"--id="+strings.Join(slots, ","),
 		"--query-gpu=pci.bus_id,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
 		"--format=csv,noheader,nounits",
 	)

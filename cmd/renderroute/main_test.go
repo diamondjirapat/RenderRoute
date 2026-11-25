@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -125,5 +127,27 @@ func TestIsSteamClientRule(t *testing.T) {
 	}
 	if isSteamClientRule("dolphin", "org.kde.dolphin", "") {
 		t.Errorf("expected unrelated app not to match")
+	}
+}
+
+func TestLoadConfigForReadFallsBackOnCorruptConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	if err := os.MkdirAll(filepath.Join(dir, "renderroute"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "renderroute", "config.json"), []byte(`{"rules": {`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadConfigForRead()
+	if cfg == nil {
+		t.Fatal("loadConfigForRead returned nil")
+	}
+	// Must not panic: this is what `renderroute run` does for every patched launcher.
+	if _, ok := cfg.MatchRule("blender"); ok {
+		t.Errorf("unexpected rule match on fallback config")
+	}
+	if g, err := resolveWithConfig([]gpu.GPU{{ID: "a", Role: gpu.RoleIntegrated}}, cfg, "default"); err != nil || g.ID != "a" {
+		t.Errorf("default resolution on fallback config failed: %v %v", g, err)
 	}
 }

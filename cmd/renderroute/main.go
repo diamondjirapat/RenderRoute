@@ -212,7 +212,7 @@ func cmdPS(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, _ := config.Load()
+	cfg := loadConfigForRead()
 	procs := proc.ListGPUProcesses(gpus, cfg)
 	if asJSON {
 		if procs == nil {
@@ -263,14 +263,33 @@ func cmdStatus(args []string) error {
 		}
 	}
 
-	gpus, err := gpu.Discover(true)
+	gpus, err := gpu.Discover(false)
 	if err != nil {
 		return err
 	}
-	cfg, _ := config.Load()
+	cfg := loadConfigForRead()
 	procs := proc.ListGPUProcesses(gpus, cfg)
 	if procs == nil {
 		procs = []proc.GPUProcess{}
+	}
+
+	// Gather telemetry after the process scan so nvidia-smi only runs for NVIDIA GPUs that already
+	// have active clients. This command is polled by the DMS widget; querying an awake-but-idle dGPU
+	// on every poll would reset its autosuspend timer and keep it from ever sleeping.
+	nvidiaInUse := map[string]bool{}
+	for _, p := range procs {
+		nvidiaInUse[p.GPUID] = true
+	}
+	gpu.PopulateMetrics(gpus, nvidiaInUse)
+	byID := make(map[string]gpu.GPU, len(gpus))
+	for _, g := range gpus {
+		byID[g.ID] = g
+	}
+	for i := range procs {
+		if g, ok := byID[procs[i].GPUID]; ok {
+			procs[i].GPUName = g.Name
+			procs[i].GPUShort = g.ShortName
+		}
 	}
 
 	counts := map[string]int{}
@@ -366,7 +385,7 @@ func cmdEnv(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, _ := config.Load()
+	cfg := loadConfigForRead()
 	target, err := resolveWithConfig(gpus, cfg, selector)
 	if err != nil {
 		return err
@@ -429,7 +448,7 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, _ := config.Load()
+	cfg := loadConfigForRead()
 
 	matchCandidates := []string{cmdArgs[0], filepath.Base(cmdArgs[0])}
 	if fpID := gpu.FlatpakAppID(cmdArgs); fpID != "" {
@@ -508,6 +527,13 @@ func cmdDefault(args []string) error {
 		}
 	}
 
+	if newSel != "" {
+		unlock, err := config.Lock()
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -590,7 +616,6 @@ func cmdRule(args []string) error {
 		desktopID := ""
 		displayName := ""
 		applyDesktop := true
-		noApplyDesktop := false
 		for i := 1; i < len(args); i++ {
 			switch args[i] {
 			case "--desktop-id":
@@ -608,7 +633,7 @@ func cmdRule(args []string) error {
 			case "--apply-desktop":
 				applyDesktop = true
 			case "--no-apply-desktop":
-				noApplyDesktop = true
+				applyDesktop = false
 			default:
 				pos = append(pos, args[i])
 			}
@@ -633,6 +658,11 @@ func cmdRule(args []string) error {
 			storedSel = resolved.ID
 		}
 
+		unlock, err := config.Lock()
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		cfg, err := config.Load()
 		if err != nil {
 			return err
@@ -664,7 +694,7 @@ func cmdRule(args []string) error {
 
 		patched := hasExisting && existing.DesktopPatched
 		var patchedAutostart []string
-		shouldPatch := !noApplyDesktop && applyDesktop
+		shouldPatch := applyDesktop
 		if shouldPatch {
 			patched = false
 			binPath := selfBinaryForDesktop()
@@ -740,6 +770,11 @@ func cmdRule(args []string) error {
 		if target == "" && desktopID == "" {
 			return errors.New("usage: renderroute rule remove <target> [--desktop-id <id>]")
 		}
+		unlock, err := config.Lock()
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		cfg, err := config.Load()
 		if err != nil {
 			return err
@@ -777,7 +812,11 @@ func cmdRule(args []string) error {
 			}
 		}
 		if !ok && !desktopReset {
-			return fmt.Errorf("no rule found for %q", target)
+			lookup := target
+			if lookup == "" {
+				lookup = desktopID
+			}
+			return fmt.Errorf("no rule found for %q", lookup)
 		}
 		if ok {
 			fmt.Printf("Removed rule for %s\n", removed.Target)
@@ -787,6 +826,11 @@ func cmdRule(args []string) error {
 		return nil
 
 	case "sync":
+		unlock, err := config.Lock()
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		cfg, err := config.Load()
 		if err != nil {
 			return err
@@ -877,7 +921,7 @@ func cmdApps(args []string) error {
 		}
 	}
 
-	cfg, _ := config.Load()
+	cfg := loadConfigForRead()
 	apps := desktop.DiscoverApps(cfg, query)
 	if asJSON {
 		if apps == nil {
@@ -933,7 +977,7 @@ func cmdLaunch(args []string) error {
 		return errors.New("missing application name or ID")
 	}
 
-	cfg, _ := config.Load()
+	cfg := loadConfigForRead()
 	apps := desktop.DiscoverApps(cfg, "")
 	app, err := desktop.FindApp(apps, appQuery)
 	if err != nil {
@@ -1062,12 +1106,16 @@ func cmdRelaunch(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, _ := config.Load()
+	cfg := loadConfigForRead()
 	target, err := resolveWithConfig(gpus, cfg, pos[1])
 	if err != nil {
 		return err
 	}
-	res, err := proc.RelaunchProcess(pid, *target, gpus, nil, force)
+	var extraEnv map[string]string
+	if r, ok := cfg.MatchRule(proc.RuleCandidates(pid)...); ok {
+		extraEnv = r.ExtraEnv
+	}
+	res, err := proc.RelaunchProcess(pid, *target, gpus, extraEnv, force)
 	if err != nil {
 		return err
 	}
@@ -1223,6 +1271,21 @@ func resolveRuleApp(apps []desktop.App, targetName, desktopID, displayName strin
 		}
 	}
 	return
+}
+
+// loadConfigForRead loads the user config for commands that only read it. A missing, unreadable,
+// or corrupt config must not break GPU routing (patched .desktop launchers exec `renderroute run`),
+// so it warns on stderr and falls back to defaults. Commands that save the config call
+// config.Load directly and refuse to proceed, so a corrupt file is never silently overwritten.
+func loadConfigForRead() *config.Config {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "renderroute: warning: %v (using default settings)\n", err)
+	}
+	if cfg == nil {
+		cfg = config.Default()
+	}
+	return cfg
 }
 
 func resolveWithConfig(gpus []gpu.GPU, cfg *config.Config, selector string) (*gpu.GPU, error) {

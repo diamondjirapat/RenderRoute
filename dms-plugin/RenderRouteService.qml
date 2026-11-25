@@ -179,7 +179,7 @@ Item {
                 root.lastError = "Failed to parse RenderRoute JSON: " + e;
                 root.syncGlobals();
             }
-        }, 50, 5000);
+        }, 50, 10000);
     }
 
     function fetchApps(query) {
